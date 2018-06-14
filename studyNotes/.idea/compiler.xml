@@ -8,12 +8,16 @@
         <outputRelativeToContentRoot value="true" />
         <module name="basic" />
         <module name="disruptor" />
+        <module name="java-basic" />
+        <module name="java-disruptor" />
+        <module name="java-netty" />
       </profile>
     </annotationProcessing>
     <bytecodeTargetLevel target="1.8">
-      <module name="basic" target="1.8" />
-      <module name="disruptor" target="1.8" />
-      <module name="studyNotes" target="1.8" />
+      <module name="java-basic" target="1.5" />
+      <module name="java-disruptor" target="1.5" />
+      <module name="java-netty" target="1.5" />
+      <module name="studyNotes" target="1.5" />
     </bytecodeTargetLevel>
   </component>
   <component name="JavacSettings">

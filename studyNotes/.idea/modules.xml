@@ -2,8 +2,9 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/basic/basic.iml" filepath="$PROJECT_DIR$/basic/basic.iml" />
-      <module fileurl="file://$PROJECT_DIR$/disruptor/disruptor.iml" filepath="$PROJECT_DIR$/disruptor/disruptor.iml" />
+      <module fileurl="file://$PROJECT_DIR$/java-basic/java-basic.iml" filepath="$PROJECT_DIR$/java-basic/java-basic.iml" />
+      <module fileurl="file://$PROJECT_DIR$/java-disruptor/java-disruptor.iml" filepath="$PROJECT_DIR$/java-disruptor/java-disruptor.iml" />
+      <module fileurl="file://$PROJECT_DIR$/java-netty/java-netty.iml" filepath="$PROJECT_DIR$/java-netty/java-netty.iml" />
       <module fileurl="file://$PROJECT_DIR$/studyNotes.iml" filepath="$PROJECT_DIR$/studyNotes.iml" />
     </modules>
   </component>
