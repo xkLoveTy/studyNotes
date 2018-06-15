@@ -1,6 +1,6 @@
 package com.study.notes.java.aop.CGLIB;
 
-import com.aop.LoggerOperation;
+import com.study.notes.java.aop.LoggerOperation;
 
 /**
  * Created by xiangke on 2016/7/6.

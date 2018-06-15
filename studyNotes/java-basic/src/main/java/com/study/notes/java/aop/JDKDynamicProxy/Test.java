@@ -1,8 +1,8 @@
 package com.study.notes.java.aop.JDKDynamicProxy;
 
-import com.aop.IService;
-import com.aop.LoggerOperation;
-import com.aop.Service;
+import com.study.notes.java.aop.IService;
+import com.study.notes.java.aop.LoggerOperation;
+import com.study.notes.java.aop.Service;
 
 /**
  * Created by xiangke on 2016/7/6.
