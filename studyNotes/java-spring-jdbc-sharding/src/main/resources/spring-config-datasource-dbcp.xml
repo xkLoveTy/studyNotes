@@ -1,0 +1,111 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<beans xmlns="http://www.springframework.org/schema/beans"
+       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+       xmlns:tx="http://www.springframework.org/schema/tx"
+       xsi:schemaLocation="http://www.springframework.org/schema/tx
+	       http://www.springframework.org/schema/tx/spring-tx-3.0.xsd
+
+           http://www.springframework.org/schema/beans
+           http://www.springframework.org/schema/beans/spring-beans-3.1.xsd">
+
+    <bean class="org.springframework.beans.factory.config.PropertyPlaceholderConfigurer">
+        <property name="locations">
+            <list>
+                <value>classpath:important.properties</value>
+                <value>classpath:config.properties</value>
+            </list>
+        </property>
+    </bean>
+
+    <tx:annotation-driven proxy-target-class="true"/>
+
+     <bean id="transactionManager" class="org.springframework.jdbc.datasource.DataSourceTransactionManager">
+        <property name="dataSource" ref="routingDataSource"/>
+    </bean>
+
+    <bean id="sqlSessionFactory" class="org.mybatis.spring.SqlSessionFactoryBean">
+        <property name="dataSource" ref="routingDataSource"/>
+       <!-- <property name="configLocation" value="classpath:/mybatis-config.xml"/>-->
+    </bean>
+
+    <bean id="parentDataSource" class="org.apache.commons.dbcp.BasicDataSource">
+        <property name="driverClassName" value="${imp.jdbc.driver}"/>
+        <property name="username" value="${imp.jdbc.username}"/>
+        <property name="connectionProperties" value="${dbcp.connectionProperties}"/>
+        <property name="validationQuery" value="select 1"/>
+        <property name="initialSize" value="${dbcp.initialSize}"/>
+        <property name="maxActive" value="${dbcp.maxActive}"/>
+        <property name="minIdle" value="${dbcp.minIdle}"/>
+        <property name="maxIdle" value="${dbcp.maxIdle}"/>
+    </bean>
+
+    <bean id="dataSource0" class="org.apache.commons.dbcp.BasicDataSource" parent="parentDataSource">
+        <property name="url" value="${imp.jdbc.url0}"/>
+        <property name="password" value="${imp.jdbc.password.new}"/>
+    </bean>
+
+    <bean id="dataSource1" class="org.apache.commons.dbcp.BasicDataSource" parent="parentDataSource">
+        <property name="url" value="${imp.jdbc.url1}"/>
+        <property name="password" value="${imp.jdbc.password.new}"/>
+    </bean>
+
+    <bean id="dataSource2" class="org.apache.commons.dbcp.BasicDataSource" parent="parentDataSource">
+        <property name="url" value="${imp.jdbc.url2}"/>
+        <property name="password" value="${imp.jdbc.password.new}"/>
+    </bean>
+
+    <bean id="dataSource3" class="org.apache.commons.dbcp.BasicDataSource" parent="parentDataSource">
+        <property name="url" value="${imp.jdbc.url3}"/>
+        <property name="password" value="${imp.jdbc.password.new}"/>
+    </bean>
+    
+    <bean id="dataSource4" class="org.apache.commons.dbcp.BasicDataSource" parent="parentDataSource">
+        <property name="url" value="${imp.jdbc.url4}"/>
+        <property name="password" value="${imp.jdbc.password.new}"/>
+    </bean>
+    
+    <bean id="dataSource5" class="org.apache.commons.dbcp.BasicDataSource" parent="parentDataSource">
+        <property name="url" value="${imp.jdbc.url5}"/>
+        <property name="password" value="${imp.jdbc.password.new}"/>
+    </bean>
+    
+    <bean id="dataSource6" class="org.apache.commons.dbcp.BasicDataSource" parent="parentDataSource">
+        <property name="url" value="${imp.jdbc.url6}"/>
+        <property name="password" value="${imp.jdbc.password.new}"/>
+    </bean>
+    
+    <bean id="dataSource7" class="org.apache.commons.dbcp.BasicDataSource" parent="parentDataSource">
+        <property name="url" value="${imp.jdbc.url7}"/>
+        <property name="password" value="${imp.jdbc.password.new}"/>
+    </bean>
+
+    <bean id="pinRoutingStrategy" class="com.study.notes.jdbc.sharding.PinRoutingStrategy">
+        <property name="dbName" value="address"/>
+        <property name="dbNum" value="${mvn.db.num}"/>
+    </bean>
+
+    <bean id="routingDataSource" class="com.study.notes.jdbc.sharding.RoutingDataSource">
+        <property name="targetDataSources">
+            <map key-type="java.lang.String">
+                <entry key="address_0" value-ref="dataSource0"/>
+                <entry key="address_1" value-ref="dataSource1"/>
+                <entry key="address_2" value-ref="dataSource2"/>
+                <entry key="address_3" value-ref="dataSource3"/>
+                <entry key="address_4" value-ref="dataSource4"/>
+                <entry key="address_5" value-ref="dataSource5"/>
+                <entry key="address_6" value-ref="dataSource6"/>
+                <entry key="address_7" value-ref="dataSource7"/>
+            </map>
+        </property>
+        <property name="routingStrategy" ref="pinRoutingStrategy"/>
+    </bean>
+
+    <bean id="sqlSession" class="org.mybatis.spring.SqlSessionTemplate">
+        <constructor-arg index="0" ref="sqlSessionFactory"/>
+    </bean>
+
+    <bean id="addressDao" class="com.study.notes.dao.impl.AddressDaoImpl">
+        <property name="shardsNumber" value="${mvn.shards.num}"/>
+    </bean>
+
+</beans>

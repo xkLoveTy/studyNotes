@@ -12,6 +12,7 @@
         <module>java-basic</module>
         <module>java-disruptor</module>
         <module>java-netty</module>
+        <module>java-spring-jdbc-sharding</module>
     </modules>
 
     <properties>
