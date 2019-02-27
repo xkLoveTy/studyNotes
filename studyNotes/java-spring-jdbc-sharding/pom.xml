@@ -9,7 +9,7 @@
     </parent>
     <modelVersion>4.0.0</modelVersion>
 
-    <artifactId>java-jdbc-sharding</artifactId>
+    <artifactId>java-spring-jdbc-sharding</artifactId>
 
     <properties>
         <spring.version>4.2.4.RELEASE</spring.version>
