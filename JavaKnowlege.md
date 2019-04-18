@@ -11301,4 +11301,2344 @@ j2ee特别牛
 
 重复上面的步骤，新的数据不断进入 buffer 和 translog，不断将 `buffer` 数据写入一个又一个新的 `segment file` 中去，每次 `refresh` 完 buffer 清空，translog 保留。随着这个过程推进，translog 会变得越来越大。当 translog 达到一定长度的时候，就会触发 `commit` 操作。
 
-commit 操作发生第一步，就是将 b
+commit 操作发生第一步，就是将 buffer 中现有数据 `refresh` 到 `os cache` 中去，清空 buffer。然后，将一个 `commit point` 写入磁盘文件，里面标识着这个 `commit point` 对应的所有 `segment file`，同时强行将 `os cache` 中目前所有的数据都 `fsync` 到磁盘文件中去。最后**清空** 现有 translog 日志文件，重启一个 translog，此时 commit 操作完成。
+
+这个 commit 操作叫做 `flush`。默认 30 分钟自动执行一次 `flush`，但如果 translog 过大，也会触发 `flush`。flush 操作就对应着 commit 的全过程，我们可以通过 es api，手动执行 flush 操作，手动将 os cache 中的数据 fsync 强刷到磁盘上去。
+
+translog 日志文件的作用是什么？你执行 commit 操作之前，数据要么是停留在 buffer 中，要么是停留在 os cache 中，无论是 buffer 还是 os cache 都是内存，一旦这台机器死了，内存中的数据就全丢了。所以需要将数据对应的操作写入一个专门的日志文件 `translog` 中，一旦此时机器宕机，再次重启的时候，es 会自动读取 translog 日志文件中的数据，恢复到内存 buffer 和 os cache 中去。
+
+translog 其实也是先写入 os cache 的，默认每隔 5 秒刷一次到磁盘中去，所以默认情况下，可能有 5 秒的数据会仅仅停留在 buffer 或者 translog 文件的 os cache 中，如果此时机器挂了，会**丢失** 5 秒钟的数据。但是这样性能比较好，最多丢 5 秒的数据。也可以将 translog 设置成每次写操作必须是直接 `fsync` 到磁盘，但是性能会差很多。
+
+实际上你在这里，如果面试官没有问你 es 丢数据的问题，你可以在这里给面试官炫一把，你说，其实 es 第一是准实时的，数据写入 1 秒后可以搜索到；可能会丢失数据的。有 5 秒的数据，停留在 buffer、translog os cache、segment file os cache 中，而不在磁盘上，此时如果宕机，会导致 5 秒的**数据丢失**。
+
+**总结一下**，数据先写入内存 buffer，然后每隔 1s，将数据 refresh 到 os cache，到了 os cache 数据就能被搜索到（所以我们才说 es 从写入到能被搜索到，中间有 1s 的延迟）。每隔 5s，将数据写入 translog 文件（这样如果机器宕机，内存数据全没，最多会有 5s 的数据丢失），translog 大到一定程度，或者默认每隔 30mins，会触发 commit 操作，将缓冲区的数据都 flush 到 segment file 磁盘文件中。
+
+> 数据写入 segment file 之后，同时就建立好了倒排索引。
+
+#### 删除/更新数据底层原理
+
+如果是删除操作，commit 的时候会生成一个 `.del` 文件，里面将某个 doc 标识为 `deleted` 状态，那么搜索的时候根据 `.del` 文件就知道这个 doc 是否被删除了。
+
+如果是更新操作，就是将原来的 doc 标识为 `deleted` 状态，然后新写入一条数据。
+
+buffer 每 refresh 一次，就会产生一个 `segment file`，所以默认情况下是 1 秒钟一个 `segment file`，这样下来 `segment file` 会越来越多，此时会定期执行 merge。每次 merge 的时候，会将多个 `segment file` 合并成一个，同时这里会将标识为 `deleted` 的 doc 给**物理删除掉**，然后将新的 `segment file` 写入磁盘，这里会写一个 `commit point`，标识所有新的 `segment file`，然后打开 `segment file` 供搜索使用，同时删除旧的 `segment file`。
+
+#### 底层 lucene
+
+简单来说，lucene 就是一个 jar 包，里面包含了封装好的各种建立倒排索引的算法代码。我们用 Java 开发的时候，引入 lucene jar，然后基于 lucene 的 api 去开发就可以了。
+
+通过 lucene，我们可以将已有的数据建立索引，lucene 会在本地磁盘上面，给我们组织索引的数据结构。
+
+#### 倒排索引
+
+在搜索引擎中，每个文档都有一个对应的文档 ID，文档内容被表示为一系列关键词的集合。例如，文档 1 经过分词，提取了 20 个关键词，每个关键词都会记录它在文档中出现的次数和出现位置。
+
+那么，倒排索引就是**关键词到文档** ID 的映射，每个关键词都对应着一系列的文件，这些文件中都出现了关键词。
+
+举个栗子。
+
+有以下文档：
+
+| DocId | Doc                                            |
+| ----- | ---------------------------------------------- |
+| 1     | 谷歌地图之父跳槽 Facebook                      |
+| 2     | 谷歌地图之父加盟 Facebook                      |
+| 3     | 谷歌地图创始人拉斯离开谷歌加盟 Facebook        |
+| 4     | 谷歌地图之父跳槽 Facebook 与 Wave 项目取消有关 |
+| 5     | 谷歌地图之父拉斯加盟社交网站 Facebook          |
+
+对文档进行分词之后，得到以下**倒排索引**。
+
+| WordId | Word     | DocIds    |
+| ------ | -------- | --------- |
+| 1      | 谷歌     | 1,2,3,4,5 |
+| 2      | 地图     | 1,2,3,4,5 |
+| 3      | 之父     | 1,2,4,5   |
+| 4      | 跳槽     | 1,4       |
+| 5      | Facebook | 1,2,3,4,5 |
+| 6      | 加盟     | 2,3,5     |
+| 7      | 创始人   | 3         |
+| 8      | 拉斯     | 3,5       |
+| 9      | 离开     | 3         |
+| 10     | 与       | 4         |
+| ..     | ..       | ..        |
+
+另外，实用的倒排索引还可以记录更多的信息，比如文档频率信息，表示在文档集合中有多少个文档包含某个单词。
+
+那么，有了倒排索引，搜索引擎可以很方便地响应用户的查询。比如用户输入查询 `Facebook`，搜索系统查找倒排索引，从中读出包含这个单词的文档，这些文档就是提供给用户的搜索结果。
+
+要注意倒排索引的两个重要细节：
+
+- 倒排索引中的所有词项对应一个或多个文档；
+- 倒排索引中的词项**根据字典顺序升序排列**
+
+> 上面只是一个简单的栗子，并没有严格按照字典顺序升序排列。
+
+#### es 生产集群的部署架构是什么？每个索引的数据量大概有多少？每个索引大概有多少个分片？
+
+冷、热集群部署。热集群存一周的数据，用于生产。冷集群存全量数据，用于查询历史数据。
+
+- es 生产集群我们部署了 8 台机器，每台机器是 32 核 128G 的，集群总内存是 8 * 128G。
+- 我们 es 集群的日增量数据大概是 100 万条，每天日增量数据大概是 500MB，每月增量数据大概是 3000 万，15G。目前系统已经运行了3年，现在 es 集群里数据总量大概是 10G 左右。
+- 目前线上有 2 个索引（这个结合你们自己业务来，看看自己有哪些数据可以放 es 的），每个索引的数据量大概是 20G，所以这个数据量之内，我们每个索引分配的是 8 个 primary shard，一主一从shard
+
+#### es 在数据量很大的情况下（数十亿级别）如何提高查询效率啊？
+
+##### 性能优化的杀手锏——filesystem cache
+
+你往 es 里写的数据，实际上都写到磁盘文件里去了，**查询的时候**，操作系统会将磁盘文件里的数据自动缓存到 `filesystem cache` 里面去。
+
+[![es-search-process](https://github.com/Fi-Null/advanced-java/raw/master/images/es-search-process.png)](https://github.com/Fi-Null/advanced-java/blob/master/images/es-search-process.png)
+
+es 的搜索引擎严重依赖于底层的 `filesystem cache`，你如果给 `filesystem cache` 更多的内存，尽量让内存可以容纳所有的 `idx segment file `索引数据文件，那么你搜索的时候就基本都是走内存的，性能会非常高。
+
+性能差距究竟可以有多大？我们之前很多的测试和压测，如果走磁盘一般肯定上秒，搜索性能绝对是秒级别的，1秒、5秒、10秒。但如果是走 `filesystem cache`，是走纯内存的，那么一般来说性能比走磁盘要高一个数量级，基本上就是毫秒级的，从几毫秒到几百毫秒不等。
+
+这里有个真实的案例。某个公司 es 节点有 3 台机器，每台机器看起来内存很多，64G，总内存就是 `64 * 3 = 192G`。每台机器给 es jvm heap 是 `32G`，那么剩下来留给 `filesystem cache` 的就是每台机器才 `32G`，总共集群里给 `filesystem cache` 的就是 `32 * 3 = 96G` 内存。而此时，整个磁盘上索引数据文件，在 3 台机器上一共占用了 `1T` 的磁盘容量，es 数据量是 `1T`，那么每台机器的数据量是 `300G`。这样性能好吗？ `filesystem cache` 的内存才 100G，十分之一的数据可以放内存，其他的都在磁盘，然后你执行搜索操作，大部分操作都是走磁盘，性能肯定差。
+
+归根结底，你要让 es 性能要好，最佳的情况下，就是你的机器的内存，至少可以容纳你的总数据量的一半。
+
+根据我们自己的生产环境实践经验，最佳的情况下，是仅仅在 es 中就存少量的数据，就是你要**用来搜索的那些索引**，如果内存留给 `filesystem cache` 的是 100G，那么你就将索引数据控制在 `100G` 以内，这样的话，你的数据几乎全部走内存来搜索，性能非常之高，一般可以在 1 秒以内。
+
+比如说你现在有一行数据。`id,name,age ....` 30 个字段。但是你现在搜索，只需要根据 `id,name,age` 三个字段来搜索。如果你傻乎乎往 es 里写入一行数据所有的字段，就会导致说 `90%` 的数据是不用来搜索的，结果硬是占据了 es 机器上的 `filesystem cache` 的空间，单条数据的数据量越大，就会导致 `filesystem cahce` 能缓存的数据就越少。其实，仅仅写入 es 中要用来检索的**少数几个字段**就可以了，比如说就写入 es `id,name,age` 三个字段，然后你可以把其他的字段数据存在 mysql/hbase 里，我们一般是建议用 `es + hbase` 这么一个架构。
+
+hbase 的特点是**适用于海量数据的在线存储**，就是对 hbase 可以写入海量数据，但是不要做复杂的搜索，做很简单的一些根据 id 或者范围进行查询的这么一个操作就可以了。从 es 中根据 name 和 age 去搜索，拿到的结果可能就 20 个 `doc id`，然后根据 `doc id` 到 hbase 里去查询每个 `doc id` 对应的**完整的数据**，给查出来，再返回给前端。
+
+写入 es 的数据最好小于等于，或者是略微大于 es 的 filesystem cache 的内存容量。然后你从 es 检索可能就花费 20ms，然后再根据 es 返回的 id 去 hbase 里查询，查 20 条数据，可能也就耗费个 30ms，可能你原来那么玩儿，1T 数据都放 es，会每次查询都是 5~10s，现在可能性能就会很高，每次查询就是 50ms。
+
+##### 数据预热
+
+假如说，哪怕是你就按照上述的方案去做了，es 集群中每个机器写入的数据量还是超过了 `filesystem cache` 一倍，比如说你写入一台机器 60G 数据，结果 `filesystem cache` 就 30G，还是有 30G 数据留在了磁盘上。
+
+其实可以做**数据预热**。
+
+举个例子，拿微博来说，你可以把一些大V，平时看的人很多的数据，你自己提前后台搞个系统，每隔一会儿，自己的后台系统去搜索一下热数据，刷到 `filesystem cache` 里去，后面用户实际上来看这个热数据的时候，他们就是直接从内存里搜索了，很快。
+
+或者是电商，你可以将平时查看最多的一些商品，比如说 iphone 8，热数据提前后台搞个程序，每隔 1 分钟自己主动访问一次，刷到 `filesystem cache` 里去。
+
+对于那些你觉得比较热的、经常会有人访问的数据，最好**做一个专门的缓存预热子系统**，就是对热数据每隔一段时间，就提前访问一下，让数据进入 `filesystem cache` 里面去。这样下次别人访问的时候，性能一定会好很多。
+
+##### 冷热分离
+
+es 可以做类似于 mysql 的水平拆分，就是说将大量的访问很少、频率很低的数据，单独写一个索引，然后将访问很频繁的热数据单独写一个索引。最好是将**冷数据写入一个索引中，然后热数据写入另外一个索引中**，这样可以确保热数据在被预热之后，尽量都让他们留在 `filesystem os cache` 里，**别让冷数据给冲刷掉**。
+
+你看，假设你有 6 台机器，2 个索引，一个放冷数据，一个放热数据，每个索引 3 个 shard。3 台机器放热数据 index，另外 3 台机器放冷数据 index。然后这样的话，你大量的时间是在访问热数据 index，热数据可能就占总数据量的 10%，此时数据量很少，几乎全都保留在 `filesystem cache` 里面了，就可以确保热数据的访问性能是很高的。但是对于冷数据而言，是在别的 index 里的，跟热数据 index 不在相同的机器上，大家互相之间都没什么联系了。如果有人访问冷数据，可能大量数据是在磁盘上的，此时性能差点，就 10% 的人去访问冷数据，90% 的人在访问热数据，也无所谓了。
+
+##### document 模型设计
+
+对于 MySQL，我们经常有一些复杂的关联查询。在 es 里该怎么玩儿，es 里面的复杂的关联查询尽量别用，一旦用了性能一般都不太好。
+
+最好是先在 Java 系统里就完成关联，将关联好的数据直接写入 es 中。搜索的时候，就不需要利用 es 的搜索语法来完成 join 之类的关联搜索了。
+
+document 模型设计是非常重要的，很多操作，不要在搜索的时候才想去执行各种复杂的乱七八糟的操作。es 能支持的操作就那么多，不要考虑用 es 做一些它不好操作的事情。如果真的有那种操作，尽量在 document 模型设计的时候，写入的时候就完成。另外对于一些太复杂的操作，比如 join/nested/parent-child 搜索都要尽量避免，性能都很差的。
+
+##### 分页性能优化
+
+es 的分页是较坑的，为啥呢？举个例子吧，假如你每页是 10 条数据，你现在要查询第 100 页，实际上是会把每个 shard 上存储的前 1000 条数据都查到一个协调节点上，如果你有个 5 个 shard，那么就有 5000 条数据，接着协调节点对这 5000 条数据进行一些合并、处理，再获取到最终第 100 页的 10 条数据。
+
+分布式的，你要查第 100 页的 10 条数据，不可能说从 5 个 shard，每个 shard 就查 2 条数据，最后到协调节点合并成 10 条数据吧？你**必须**得从每个 shard 都查 1000 条数据过来，然后根据你的需求进行排序、筛选等等操作，最后再次分页，拿到里面第 100 页的数据。你翻页的时候，翻的越深，每个 shard 返回的数据就越多，而且协调节点处理的时间越长，非常坑爹。所以用 es 做分页的时候，你会发现越翻到后面，就越是慢。
+
+我们之前也是遇到过这个问题，用 es 作分页，前几页就几十毫秒，翻到 10 页或者几十页的时候，基本上就要 5~10 秒才能查出来一页数据了。
+
+有什么解决方案吗？
+
+###### 不允许深度分页（默认深度分页性能很差）
+
+跟产品经理说，你系统不允许翻那么深的页，默认翻的越深，性能就越差。
+
+###### 类似于 app 里的推荐商品不断下拉出来一页一页的
+
+类似于微博中，下拉刷微博，刷出来一页一页的，你可以用 `scroll api`，关于如何使用，自行上网搜索。
+
+scroll 会一次性给你生成**所有数据的一个快照**，然后每次滑动向后翻页就是通过**游标** `scroll_id` 移动，获取下一页下一页这样子，性能会比上面说的那种分页性能要高很多很多，基本上都是毫秒级的。
+
+但是，唯一的一点就是，这个适合于那种类似微博下拉翻页的，**不能随意跳到任何一页的场景**。也就是说，你不能先进入第 10 页，然后去第 120 页，然后又回到第 58 页，不能随意乱跳页。所以现在很多产品，都是不允许你随意翻页的，app，也有一些网站，做的就是你只能往下拉，一页一页的翻。
+
+初始化时必须指定 `scroll` 参数，告诉 es 要保存此次搜索的上下文多长时间。你需要确保用户不会持续不断翻页翻几个小时，否则可能因为超时而失败。
+
+除了用 `scroll api`，你也可以用 `search_after` 来做，`search_after` 的思想是使用前一页的结果来帮助检索下一页的数据，显然，这种方式也不允许你随意翻页，你只能一页页往后翻。初始化时，需要使用一个唯一值的字段作为 sort 字段。
+
+## 四、分布式
+
+https://juejin.im/post/5b2664bd51882574874d8a76
+
+### 1、RPC框架(dubbo、Jsf）
+
+#### 说一下的 dubbo 的工作原理？注册中心挂了可以继续通信吗？说说一次 rpc 请求的流程？
+
+##### dubbo 工作原理
+
+- 第一层：service 层，接口层，给服务提供者和消费者来实现的
+- 第二层：config 层，配置层，主要是对 dubbo 进行各种配置的
+- 第三层：proxy 层，服务代理层，无论是 consumer 还是 provider，dubbo 都会给你生成代理，代理之间进行网络通信
+- 第四层：registry 层，服务注册层，负责服务的注册与发现
+- 第五层：cluster 层，集群层，封装多个服务提供者的路由以及负载均衡，将多个实例组合成一个服务
+- 第六层：monitor 层，监控层，对 rpc 接口的调用次数和调用时间进行监控
+- 第七层：protocal 层，远程调用层，封装 rpc 调用
+- 第八层：exchange 层，信息交换层，封装请求响应模式，同步转异步
+- 第九层：transport 层，网络传输层，抽象 mina 和 netty 为统一接口
+- 第十层：serialize 层，数据序列化层
+
+##### 工作流程
+
+- 第一步：provider 向注册中心去注册
+- 第二步：consumer 从注册中心订阅服务，注册中心会通知 consumer 注册好的服务
+- 第三步：consumer 调用 provider
+- 第四步：consumer 和 provider 都异步通知监控中心
+
+[![dubbo-operating-principle](https://github.com/Fi-Null/advanced-java/raw/master/images/dubbo-operating-principle.png)](https://github.com/Fi-Null/advanced-java/blob/master/images/dubbo-operating-principle.png)
+
+##### 注册中心挂了可以继续通信吗？
+
+可以，因为刚开始初始化的时候，消费者会将提供者的地址等信息**拉取到本地缓存**，所以注册中心挂了可以继续通信。
+
+#### 分布式服务接口的幂等性如何设计（比如不能重复扣款）？
+
+假如你有个服务提供一个接口，结果这服务部署在了 5 台机器上，接着有个接口就是**付款接口**。然后人家用户在前端上操作的时候，不知道为啥，总之就是一个订单**不小心发起了两次支付请求**，然后这俩请求分散在了这个服务部署的不同的机器上，好了，结果一个订单扣款扣两次。
+
+或者是订单系统调用支付系统进行支付，结果不小心因为**网络超时**了，然后订单系统走了前面我们看到的那个重试机制，咔嚓给你重试了一把，好，支付系统收到一个支付请求两次，而且因为负载均衡算法落在了不同的机器上，尴尬了。。。
+
+这个不是技术问题，这个没有通用的一个方法，这个应该**结合业务**来保证幂等性。
+
+所谓**幂等性**，就是说一个接口，多次发起同一个请求，你这个接口得保证结果是准确的，比如不能多扣款、不能多插入一条数据、不能将统计值多加了 1。这就是幂等性。
+
+其实保证幂等性主要是三点：
+
+- 对于每个请求必须有一个唯一的标识，举个栗子：订单支付请求，肯定得包含订单 id，一个订单 id 最多支付一次，对吧。
+- 每次处理完请求之后，必须有一个记录标识这个请求处理过了。常见的方案是在 mysql 中记录个状态啥的，比如支付之前记录一条这个订单的支付流水。
+- 每次接收请求需要进行判断，判断之前是否处理过。比如说，如果有一个订单已经支付了，就已经有了一条支付流水，那么如果重复发送这个请求，则此时先插入支付流水，orderId 已经存在了，唯一键约束生效，报错插入不进去的。然后你就不用再扣款了。
+
+实际运作过程中，你要结合自己的业务来，比如说利用 redis，用 orderId 作为唯一键。只有成功插入这个支付流水，才可以执行实际的支付扣款。
+
+要求是支付一个订单，必须插入一条支付流水，order_id 建一个唯一键 `unique key`。你在支付一个订单之前，先插入一条支付流水，order_id 就已经进去了。你就可以写一个标识到 redis 里面去，`set order_id payed`，下一次重复请求过来了，先查 redis 的 order_id 对应的 value，如果是 `payed` 就说明已经支付过了，你就别重复支付了。
+
+#### dubbo 的 spi 思想是什么？
+
+##### spi 是啥？
+
+spi，简单来说，就是 `service provider interface`，说白了是什么意思呢，比如你有个接口，现在这个接口有 3 个实现类，那么在系统运行的时候对这个接口到底选择哪个实现类呢？这就需要 spi 了，需要**根据指定的配置**或者是**默认的配置**，去**找到对应的实现类**加载进来，然后用这个实现类的实例对象。
+
+举个栗子。
+
+你有一个接口A。A1/A2/A3 分别是接口A的不同实现。你通过配置 `接口A=实现A2`，那么在系统实际运行的时候，会加载你的配置，用实现A2实例化一个对象来提供服务。
+
+spi 机制一般用在哪儿？**插件扩展的场景**，比如说你开发了一个给别人使用的开源框架，如果你想让别人自己写个插件，插到你的开源框架里面，从而扩展某个功能，这个时候 spi 思想就用上了。
+
+##### Java spi 思想的体现
+
+spi 经典的思想体现，大家平时都在用，比如说 jdbc。
+
+Java 定义了一套 jdbc 的接口，但是 Java 并没有提供 jdbc 的实现类。
+
+但是实际上项目跑的时候，要使用 jdbc 接口的哪些实现类呢？一般来说，我们要**根据自己使用的数据库**，比如 mysql，你就将 `mysql-jdbc-connector.jar` 引入进来；oracle，你就将 `oracle-jdbc-connector.jar` 引入进来。
+
+在系统跑的时候，碰到你使用 jdbc 的接口，他会在底层使用你引入的那个 jar 中提供的实现类。
+
+##### dubbo 的 spi 思想
+
+dubbo 也用了 spi 思想，不过没有用 jdk 的 spi 机制，是自己实现的一套 spi 机制。
+
+```
+Protocol protocol = ExtensionLoader.getExtensionLoader(Protocol.class).getAdaptiveExtension();
+
+```
+
+Protocol 接口，在系统运行的时候，，dubbo 会判断一下应该选用这个 Protocol 接口的哪个实现类来实例化对象来使用。
+
+它会去找一个你配置的 Protocol，将你配置的 Protocol 实现类，加载到 jvm 中来，然后实例化对象，就用你的那个 Protocol 实现类就可以了。
+
+上面那行代码就是 dubbo 里大量使用的，就是对很多组件，都是保留一个接口和多个实现，然后在系统运行的时候动态根据配置去找到对应的实现类。如果你没配置，那就走默认的实现好了，没问题。
+
+```
+@SPI("dubbo")  
+public interface Protocol {  
+      
+    int getDefaultPort();  
+  
+    @Adaptive  
+    <T> Exporter<T> export(Invoker<T> invoker) throws RpcException;  
+  
+    @Adaptive  
+    <T> Invoker<T> refer(Class<T> type, URL url) throws RpcException;  
+
+    void destroy();  
+  
+}  
+
+```
+
+在 dubbo 自己的 jar 里，在`/META_INF/dubbo/internal/com.alibaba.dubbo.rpc.Protocol`文件中：
+
+```
+dubbo=com.alibaba.dubbo.rpc.protocol.dubbo.DubboProtocol
+http=com.alibaba.dubbo.rpc.protocol.http.HttpProtocol
+hessian=com.alibaba.dubbo.rpc.protocol.hessian.HessianProtocol
+
+```
+
+所以说，这就看到了 dubbo 的 spi 机制默认是怎么玩儿的了，其实就是 Protocol 接口，`@SPI("dubbo")` 说的是，通过 SPI 机制来提供实现类，实现类是通过 dubbo 作为默认 key 去配置文件里找到的，配置文件名称与接口全限定名一样的，通过 dubbo 作为 key 可以找到默认的实现类就是 `com.alibaba.dubbo.rpc.protocol.dubbo.DubboProtocol`。
+
+如果想要动态替换掉默认的实现类，需要使用 `@Adaptive` 接口，Protocol 接口中，有两个方法加了 `@Adaptive` 注解，就是说那俩接口会被代理实现。
+
+啥意思呢？
+
+比如这个 Protocol 接口搞了俩 `@Adaptive` 注解标注了方法，在运行的时候会针对 Protocol 生成代理类，这个代理类的那俩方法里面会有代理代码，代理代码会在运行的时候动态根据 url 中的 protocol 来获取那个 key，默认是 dubbo，你也可以自己指定，你如果指定了别的 key，那么就会获取别的实现类的实例了。
+
+##### 如何自己扩展 dubbo 中的组件
+
+下面来说说怎么来自己扩展 dubbo 中的组件。
+
+自己写个工程，要是那种可以打成 jar 包的，里面的 `src/main/resources` 目录下，搞一个 `META-INF/services`，里面放个文件叫：`com.alibaba.dubbo.rpc.Protocol`，文件里搞一个`my=com.bingo.MyProtocol`。自己把 jar 弄到 nexus 私服里去。
+
+然后自己搞一个 `dubbo provider` 工程，在这个工程里面依赖你自己搞的那个 jar，然后在 spring 配置文件里给个配置：
+
+<dubbo:protocol name=”my” port=”20000” />
+
+provider 启动的时候，就会加载到我们 jar 包里的`my=com.bingo.MyProtocol` 这行配置里，接着会根据你的配置使用你定义好的 MyProtocol 了，这个就是简单说明一下，你通过上述方式，可以替换掉大量的 dubbo 内部的组件，就是扔个你自己的 jar 包，然后配置一下即可。
+
+[![dubbo-spi](https://github.com/Fi-Null/advanced-java/raw/master/images/dubbo-spi.png)](https://github.com/Fi-Null/advanced-java/blob/master/images/dubbo-spi.png)
+
+dubbo 里面提供了大量的类似上面的扩展点，就是说，你如果要扩展一个东西，只要自己写个 jar，让你的 consumer 或者是 provider 工程，依赖你的那个 jar，在你的 jar 里指定目录下配置好接口名称对应的文件，里面通过 `key=实现类`。
+
+然后对于对应的组件，类似 `<dubbo:protocol>` 用你的那个 key 对应的实现类来实现某个接口，你可以自己去扩展 dubbo 的各种功能，提供你自己的实现。
+
+#### dubbo 支持哪些通信协议？支持哪些序列化协议？说一下 Hessian 的数据结构？PB 知道吗？为什么 PB 的效率是最高的？
+
+**序列化**，就是把数据结构或者是一些对象，转换为二进制串的过程，而**反序列化**是将在序列化过程中所生成的二进制串转换成数据结构或者对象的过程。
+
+[![serialize-deserialize](https://github.com/Fi-Null/advanced-java/raw/master/images/serialize-deserialize.png)](https://github.com/Fi-Null/advanced-java/blob/master/images/serialize-deserialize.png)
+
+##### dubbo 支持不同的通信协议
+
+- dubbo 协议
+
+**默认**就是走 dubbo 协议，单一长连接，进行的是 NIO 异步通信，基于 hessian 作为序列化协议。使用的场景是：传输数据量小（每次请求在 100kb 以内），但是并发量很高。
+
+为了要支持高并发场景，一般是服务提供者就几台机器，但是服务消费者有上百台，可能每天调用量达到上亿次！此时用长连接是最合适的，就是跟每个服务消费者维持一个长连接就可以，可能总共就 100 个连接。然后后面直接基于长连接 NIO 异步通信，可以支撑高并发请求。
+
+长连接，通俗点说，就是建立连接过后可以持续发送请求，无须再建立连接。
+
+[![dubbo-keep-connection](https://github.com/Fi-Null/advanced-java/raw/master/images/dubbo-keep-connection.png)](https://github.com/Fi-Null/advanced-java/blob/master/images/dubbo-keep-connection.png)
+
+而短连接，每次要发送请求之前，需要先重新建立一次连接。
+
+[![dubbo-not-keep-connection](https://github.com/Fi-Null/advanced-java/raw/master/images/dubbo-not-keep-connection.png)](https://github.com/Fi-Null/advanced-java/blob/master/images/dubbo-not-keep-connection.png)
+
+- rmi 协议
+
+走 Java 二进制序列化，多个短连接，适合消费者和提供者数量差不多的情况，适用于文件的传输，一般较少用。
+
+- hessian 协议
+
+走 hessian 序列化协议，多个短连接，适用于提供者数量比消费者数量还多的情况，适用于文件的传输，一般较少用。
+
+- http 协议
+
+走 json 序列化。
+
+- webservice
+
+走 SOAP 文本序列化。
+
+##### dubbo 支持的序列化协议
+
+dubbo 支持 hession、Java 二进制序列化、json、SOAP 文本序列化多种序列化协议。但是 hessian 是其默认的序列化协议。
+
+##### 说一下 Hessian 的数据结构
+
+Hessian 的对象序列化机制有 8 种原始类型：
+
+- 原始二进制数据
+- boolean
+- 64-bit date（64 位毫秒值的日期）
+- 64-bit double
+- 32-bit int
+- 64-bit long
+- null
+- UTF-8 编码的 string
+
+另外还包括 3 种递归类型：
+
+- list for lists and arrays
+- map for maps and dictionaries
+- object for objects
+
+还有一种特殊的类型：
+
+- ref：用来表示对共享对象的引用。
+
+##### 为什么 PB 的效率是最高的？
+
+可能有一些同学比较习惯于 `JSON` or `XML` 数据存储格式，对于 `Protocal Buffer` 还比较陌生。`Protocal Buffer` 其实是 Google 出品的一种轻量并且高效的结构化数据存储格式，性能比 `JSON`、`XML` 要高很多。
+
+其实 PB 之所以性能如此好，主要得益于两个：**第一**，它使用 proto 编译器，自动进行序列化和反序列化，速度非常快，应该比 `XML` 和 `JSON` 快上了 `20~100` 倍；**第二**，它的数据压缩效果好，就是说它序列化后的数据量体积小。因为体积小，传输起来带宽和速度上会有优化。
+
+#### 如何基于 dubbo 进行服务治理、服务降级、失败重试以及超时重试？
+
+##### 1. 调用链路自动生成
+
+一个大型的分布式系统，或者说是用现在流行的微服务架构来说吧，**分布式系统由大量的服务组成**。那么这些服务之间互相是如何调用的？调用链路是啥？说实话，几乎到后面没人搞的清楚了，因为服务实在太多了，可能几百个甚至几千个服务。
+
+那就需要基于 dubbo 做的分布式系统中，对各个服务之间的调用自动记录下来，然后自动将**各个服务之间的依赖关系和调用链路生成出来**，做成一张图，显示出来，大家才可以看到对吧。
+
+[![dubbo-service-invoke-road](https://github.com/Fi-Null/advanced-java/raw/master/images/dubbo-service-invoke-road.png)](https://github.com/Fi-Null/advanced-java/blob/master/images/dubbo-service-invoke-road.png)
+
+##### 2. 服务访问压力以及时长统计
+
+需要自动统计**各个接口和服务之间的调用次数以及访问延时**，而且要分成两个级别。
+
+- 一个级别是接口粒度，就是每个服务的每个接口每天被调用多少次，TP50/TP90/TP99，三个档次的请求延时分别是多少；
+- 第二个级别是从源头入口开始，一个完整的请求链路经过几十个服务之后，完成一次请求，每天全链路走多少次，全链路请求延时的 TP50/TP90/TP99，分别是多少。
+
+这些东西都搞定了之后，后面才可以来看当前系统的压力主要在哪里，如何来扩容和优化啊。
+
+##### 3. 其它
+
+- 服务分层（避免循环依赖）
+- 调用链路失败监控和报警
+- 服务鉴权
+- 每个服务的可用性的监控（接口调用成功率？几个9？99.99%，99.9%，99%。）
+
+##### 服务降级
+
+比如说服务 A 调用服务 B，结果服务 B 挂掉了，服务 A 重试几次调用服务 B，还是不行，那么直接降级，走一个备用的逻辑，给用户返回响应。
+
+举个栗子，我们有接口 `HelloService`。`HelloServiceImpl` 有该接口的具体实现。
+
+```
+public interface HelloService {
+
+   void sayHello();
+
+}
+
+public class HelloServiceImpl implements HelloService {
+
+    public void sayHello() {
+        System.out.println("hello world......");
+    }
+	
+}
+<?xml version="1.0" encoding="UTF-8"?>
+<beans xmlns="http://www.springframework.org/schema/beans"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:dubbo="http://code.alibabatech.com/schema/dubbo"
+    xsi:schemaLocation="http://www.springframework.org/schema/beans        http://www.springframework.org/schema/beans/spring-beans.xsd        http://code.alibabatech.com/schema/dubbo        http://code.alibabatech.com/schema/dubbo/dubbo.xsd">
+
+    <dubbo:application name="dubbo-provider" />
+    <dubbo:registry address="zookeeper://127.0.0.1:2181" />
+    <dubbo:protocol name="dubbo" port="20880" />
+    <dubbo:service interface="com.zhss.service.HelloService" ref="helloServiceImpl" timeout="10000" />
+    <bean id="helloServiceImpl" class="com.zhss.service.HelloServiceImpl" />
+
+</beans>
+
+<?xml version="1.0" encoding="UTF-8"?>
+<beans xmlns="http://www.springframework.org/schema/beans"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xmlns:dubbo="http://code.alibabatech.com/schema/dubbo"
+    xsi:schemaLocation="http://www.springframework.org/schema/beans        http://www.springframework.org/schema/beans/spring-beans.xsd        http://code.alibabatech.com/schema/dubbo        http://code.alibabatech.com/schema/dubbo/dubbo.xsd">
+
+    <dubbo:application name="dubbo-consumer"  />
+
+    <dubbo:registry address="zookeeper://127.0.0.1:2181" />
+
+    <dubbo:reference id="fooService" interface="com.test.service.FooService"  timeout="10000" check="false" mock="return null">
+    </dubbo:reference>
+
+</beans>
+
+```
+
+我们调用接口失败的时候，可以通过 `mock` 统一返回 null。
+
+mock 的值也可以修改为 true，然后再跟接口同一个路径下实现一个 Mock 类，命名规则是 “接口名称+`Mock`” 后缀。然后在 Mock 类里实现自己的降级逻辑。
+
+```
+public class HelloServiceMock implements HelloService {
+
+    public void sayHello() {
+        // 降级逻辑
+    }
+}
+
+```
+
+##### 失败重试和超时重试
+
+所谓失败重试，就是 consumer 调用 provider 要是失败了，比如抛异常了，此时应该是可以重试的，或者调用超时了也可以重试。配置如下：
+
+```
+<dubbo:reference id="xxxx" interface="xx" check="true" async="false" retries="3" timeout="2000"/>
+
+```
+
+举个栗子。
+
+某个服务的接口，要耗费 5s，你这边不能干等着，你这边配置了 timeout 之后，我等待 2s，还没返回，我直接就撤了，不能干等你。
+
+可以结合你们公司具体的场景来说说你是怎么设置这些参数的：
+
+- `timeout`：一般设置为 `200ms`，我们认为不能超过 `200ms` 还没返回。
+- `retries`：设置 retries，一般是在读请求的时候，比如你要查询个数据，你可以设置个 retries，如果第一次没读到，报错，重试指定的次数，尝试再次读取。
+
+#### 分布式服务接口请求的顺序性如何保证？
+
+其实分布式系统接口的调用顺序，也是个问题，一般来说是不用保证顺序的。但是**有时候**可能确实是需要**严格的顺序**保证。给大家举个例子，你服务 A 调用服务 B，先插入再删除。好，结果俩请求过去了，落在不同机器上，可能插入请求因为某些原因执行慢了一些，导致删除请求先执行了，此时因为没数据所以啥效果也没有；结果这个时候插入请求过来了，好，数据插入进去了，那就尴尬了。
+
+#### 本来应该是 “先插入 -> 再删除”，这条数据应该没了，结果现在 “先删除 -> 再插入”，数据还存在，最后你死都想不明白是怎么回事。
+
+首先，一般来说，个人建议是，你们从业务逻辑上设计的这个系统最好是不需要这种顺序性的保证，因为一旦引入顺序性保障，比如使用**分布式锁**，会**导致系统复杂度上升**，而且会带来**效率低下**，热点数据压力过大等问题。
+
+下面我给个我们用过的方案吧，简单来说，首先你得用 dubbo 的一致性 hash 负载均衡策略，将比如某一个订单 id 对应的请求都给分发到某个机器上去，接着就是在那个机器上因为可能还是多线程并发执行的，你可能得立即将某个订单 id 对应的请求扔一个**内存队列**里去，强制排队，这样来确保他们的顺序性。
+
+[![distributed-system-request-sequence](https://github.com/Fi-Null/advanced-java/raw/master/images/distributed-system-request-sequence.png)](https://github.com/Fi-Null/advanced-java/blob/master/images/distributed-system-request-sequence.png)
+
+但是这样引发的后续问题就很多，比如说要是某个订单对应的请求特别多，造成某台机器成**热点**怎么办？解决这些问题又要开启后续一连串的复杂技术方案......曾经这类问题弄的我们头疼不已，所以，还是建议什么呢？
+
+最好是比如说刚才那种，一个订单的插入和删除操作，能不能合并成一个操作，就是一个删除，或者是什么，避免这种问题的产生。
+
+#### dubbo 负载均衡策略和集群容错策略都有哪些？动态代理策略呢？
+
+这些都是用 dubbo 必须知道的一些东西，你得知道基本原理，知道序列化是什么协议，还得知道具体用 dubbo 的时候，如何负载均衡，如何高可用，如何动态代理。
+
+说白了，就是看你对 dubbo 熟悉不熟悉：
+
+- dubbo 工作原理：服务注册、注册中心、消费者、代理通信、负载均衡；
+- 网络通信、序列化：dubbo 协议、长连接、NIO、hessian 序列化协议；
+- 负载均衡策略、集群容错策略、动态代理策略：dubbo 跑起来的时候一些功能是如何运转的？怎么做负载均衡？怎么做集群容错？怎么生成动态代理？
+- dubbo SPI 机制：你了解不了解 dubbo 的 SPI 机制？如何基于 SPI 机制对 dubbo 进行扩展？
+
+##### dubbo 负载均衡策略
+
+###### random loadbalance
+
+默认情况下，dubbo 是 random load balance **随机**调用实现负载均衡，可以对 provider 不同实例**设置不同的权重**，会按照权重来负载均衡，权重越大分配流量越高，一般就用这个默认的就可以了。
+
+###### roundrobin loadbalance
+
+这个的话默认就是均匀地将流量打到各个机器上去，但是如果各个机器的性能不一样，容易导致性能差的机器负载过高。所以此时需要调整权重，让性能差的机器承载权重小一些，流量少一些。
+
+举个栗子。
+
+跟运维同学申请机器，有的时候，我们运气好，正好公司资源比较充足，刚刚有一批热气腾腾、刚刚做好的一批虚拟机新鲜出炉，配置都比较高：8核+16G 机器，申请到 2 台。过了一段时间，我们感觉 2 台机器有点不太够，我就去找运维同学说，“哥儿们，你能不能再给我一台机器”，但是这时只剩下一台 4核+8G 的机器。我要还是得要。
+
+这个时候，可以给两台 8核16G 的机器设置权重 4，给剩余 1 台 4核8G 的机器设置权重 2。
+
+###### leastactive loadbalance
+
+这个就是自动感知一下，如果某个机器性能越差，那么接收的请求越少，越不活跃，此时就会给**不活跃的性能差的机器更少的请求**。
+
+###### consistanthash loadbalance
+
+一致性 Hash 算法，相同参数的请求一定分发到一个 provider 上去，provider 挂掉的时候，会基于虚拟节点均匀分配剩余的流量，抖动不会太大。**如果你需要的不是随机负载均衡**，是要一类请求都到一个节点，那就走这个一致性 Hash 策略。
+
+##### dubbo 集群容错策略
+
+###### failover cluster 模式
+
+失败自动切换，自动重试其他机器，默认就是这个，常见于读操作。（失败重试其它机器）
+
+###### failfast cluster模式
+
+一次调用失败就立即失败，常见于写操作。（调用失败就立即失败）
+
+###### failsafe cluster 模式
+
+出现异常时忽略掉，常用于不重要的接口调用，比如记录日志。
+
+###### failback cluster 模式
+
+失败了后台自动记录请求，然后定时重发，比较适合于写消息队列这种。
+
+###### forking cluster 模式
+
+**并行调用**多个 provider，只要一个成功就立即返回。
+
+###### broadcacst cluster
+
+逐个调用所有的 provider。
+
+##### dubbo动态代理策略
+
+默认使用 javassist 动态字节码生成，创建代理类。但是可以通过 spi 扩展机制配置自己的动态代理策略。
+
+#### 如何自己设计一个类似 Dubbo 的 RPC 框架？
+
+最简单的回答思路：
+
+- 上来你的服务就得去注册中心注册吧，你是不是得有个注册中心，保留各个服务的信心，可以用 zookeeper 来做，对吧。
+- 然后你的消费者需要去注册中心拿对应的服务信息吧，对吧，而且每个服务可能会存在于多台机器上。
+- 接着你就该发起一次请求了，咋发起？当然是基于动态代理了，你面向接口获取到一个动态代理，这个动态代理就是接口在本地的一个代理，然后这个代理会找到服务对应的机器地址。
+- 然后找哪个机器发送请求？那肯定得有个负载均衡算法了，比如最简单的可以随机轮询是不是。
+- 接着找到一台机器，就可以跟它发送请求了，第一个问题咋发送？你可以说用 netty 了，nio 方式；第二个问题发送啥格式数据？你可以说用 hessian 序列化协议了，或者是别的，对吧。然后请求过去了。
+- 服务器那边一样的，需要针对你自己的服务生成一个动态代理，监听某个网络端口了，然后代理你本地的服务代码。接收到请求的时候，就调用对应的服务代码，对吧。
+
+### 2、Zookeeper
+
+#### 1.ZooKeeper是什么？
+
+ZooKeeper是一个**分布式**的，开放源码的分布式**应用程序协调服务**，是Google的Chubby一个开源的实现，它是**集群的管理者**，**监视着集群中各个节点的状态根据节点提交的反馈进行下一步合理操作**。最终，将简单易用的接口和性能高效、功能稳定的系统提供给用户。
+客户端的**读请求**可以被集群中的**任意一台机器处理**，如果读请求在节点上注册了监听器，这个监听器也是由所连接的zookeeper机器来处理。对于**写请求**，这些请求会同**时发给其他zookeeper机器并且达成一致后，请求才会返回成功**。因此，随着**zookeeper的集群机器增多，读请求的吞吐会提高但是写请求的吞吐会下降**。
+有序性是zookeeper中非常重要的一个特性，所有的**更新都是全局有序的**，每个更新都有一个**唯一的时间戳**，这个时间戳称为**zxid（Zookeeper Transaction Id）**。而**读请求只会相对于更新有序**，也就是读请求的返回结果中会带有这个**zookeeper最新的zxid**。
+
+#### 2.ZooKeeper提供了什么？
+
+1、**文件系统**
+
+2、**通知机制**
+
+#### 3.Zookeeper文件系统
+
+Zookeeper提供一个多层级的节点命名空间（节点称为znode）。与文件系统不同的是，这些节点**都可以设置关联的数据**，而文件系统中只有文件节点可以存放数据而目录节点不行。Zookeeper为了保证高吞吐和低延迟，在内存中维护了这个树状的目录结构，这种特性使得Zookeeper**不能用于存放大量的数据**，每个节点的存放数据上限为**1M**。
+
+#### 4.四种类型的znode
+
+1、**PERSISTENT-持久化目录节点** 
+客户端与zookeeper断开连接后，该节点依旧存在 
+2、**PERSISTENT_SEQUENTIAL-持久化顺序编号目录节点**
+客户端与zookeeper断开连接后，该节点依旧存在，只是Zookeeper给该节点名称进行顺序编号 
+3、**EPHEMERAL-临时目录节点**
+客户端与zookeeper断开连接后，该节点被删除 
+4、**EPHEMERAL_SEQUENTIAL-临时顺序编号目录节点**
+客户端与zookeeper断开连接后，该节点被删除，只是Zookeeper给该节点名称进行顺序编号
+
+<div align="center"> <img src="pics/zkNode.png"/> </div><br>
+
+#### 5.Zookeeper通知机制
+
+client端会对某个znode建立一个**watcher事件**，当该znode发生变化时，这些client会收到zk的通知，然后client可以根据znode变化来做出业务上的改变等。
+
+#### 6.Zookeeper做了什么？
+
+##### 1、命名服务（文件系统）
+
+​	命名服务是指通过指定的名字来**获取资源**或者**服务的地址**，利用zk创建一个全局的路径，即是**唯一**的路径，这个路径就可以作为一个名字，指向集群中的集群，提供的服务的地址，或者一个远程的对象等等。
+
+##### 2、配置管理
+
+​	程序分布式的部署在不同的机器上，将程序的配置信息放在zk的**znode**下，当有配置发生改变时，也就是znode发生变化时，可以通过改变zk中某个目录节点的内容，利用**watcher**通知给各个客户端，从而更改配置。
+
+##### 3、集群管理（文件系统、通知机制）
+
+​	所谓集群管理无在乎两点：**是否有机器退出和加入、选举master**。 
+​	对于第一点，所有机器约定在父目录下**创建临时目录节点**，然后监听父目录节点的子节点变化消息。一旦有机器挂掉，该机器与 zookeeper的连接断开，其所创建的临时目录节点被删除，**所有其他机器都收到通知：某个兄弟目录被删除**，于是，所有人都知道：它上船了。
+​	新机器加入也是类似，**所有机器收到通知：新兄弟目录加入**，highcount又有了，对于第二点，我们稍微改变一下，**所有机器创建临时顺序编号目录节点，每次选取编号最小的机器作为master就好**。	
+
+##### 4、分布式锁（文件系统、通知机制）
+
+​	有了zookeeper的一致性文件系统，锁的问题变得容易。锁服务可以分为两类，一个是**保持独占**，另一个是**控制时序**。 
+​	对于第一类，我们将zookeeper上的一个**znode看作是一把锁**，通过createznode的方式来实现。所有客户端都去创建 /distribute_lock 节点，最终成功创建的那个客户端也即拥有了这把锁。用完删除掉自己创建的distribute_lock 节点就释放出锁。 
+​	对于第二类， /distribute_lock 已经预先存在，所有客户端在它下面创建临时顺序编号目录节点，和选master一样，**编号最小的获得锁**，用完删除，依次方便。
+
+<div align="center"> <img src="pics/zkLock.png"/> </div><br>
+
+在获取分布式锁的时候在locker节点下创建临时顺序节点，释放锁的时候删除该临时节点。客户端调用createNode方法在locker下创建临时顺序节点，
+然后调用getChildren(“locker”)来获取locker下面的所有子节点，注意此时不用设置任何Watcher。客户端获取到所有的子节点path之后，如果发现自己创建的节点在所有创建的子节点序号最小，那么就认为该客户端获取到了锁。如果发现自己创建的节点并非locker所有子节点中最小的，说明自己还没有获取到锁，此时客户端需要找到**比自己小的那个节点**，然后对其调用**exist()**方法，同时对其注册事件监听器。之后，让这个被关注的节点删除，则客户端的Watcher会收到相应通知，此时再次判断自己创建的节点是否是locker子节点中序号最小的，如果是则获取到了锁，如果不是则重复以上步骤继续获取到比自己小的一个节点并注册监听。当前这个过程中还需要许多的逻辑判断。
+
+<div align="center"> <img src="pics/zkLock2.png"/> </div><br>
+
+代码的实现主要是基于互斥锁，获取分布式锁的重点逻辑在于**BaseDistributedLock**，实现了基于Zookeeper实现分布式锁的细节。
+
+##### 5、队列管理
+
+两种类型的队列：
+1、同步队列，当一个队列的成员都聚齐时，这个队列才可用，否则一直等待所有成员到达。 
+2、队列按照 FIFO 方式进行入队和出队操作。 
+第一类，在约定目录下创建临时目录节点，监听节点数目是否是我们要求的数目。 
+第二类，和分布式锁服务中的控制时序场景基本原理一致，入列有编号，出列按编号。在特定的目录下创建**PERSISTENT_SEQUENTIAL**节点，创建成功时**Watcher**通知等待的队列，队列删除**序列号最小的节点**用以消费。此场景下Zookeeper的znode用于消息存储，znode存储的数据就是消息队列中的消息内容，SEQUENTIAL序列号就是消息的编号，按序取出即可。由于创建的节点是持久化的，所以**不必担心队列消息的丢失问题**。
+
+#### 7.Zookeeper数据复制
+
+Zookeeper作为一个集群提供一致的数据服务，自然，它要在**所有机器间**做数据复制。数据复制的好处： 
+1、容错：一个节点出错，不致于让整个系统停止工作，别的节点可以接管它的工作； 
+2、提高系统的扩展能力 ：把负载分布到多个节点上，或者增加节点来提高系统的负载能力； 
+3、提高性能：让**客户端本地访问就近的节点，提高用户访问速度**。
+
+从客户端读写访问的透明度来看，数据复制集群系统分下面两种： 
+1、**写主**(WriteMaster) ：对数据的**修改提交给指定的节点**。读无此限制，可以读取任何一个节点。这种情况下客户端需要对读与写进行区别，俗称**读写分离**； 
+2、**写任意**(Write Any)：对数据的**修改可提交给任意的节点**，跟读一样。这种情况下，客户端对集群节点的角色与变化透明。
+
+对zookeeper来说，它采用的方式是**写任意**。通过增加机器，它的读吞吐能力和响应能力扩展性非常好，而写，随着机器的增多吞吐能力肯定下降（这也是它建立observer的原因），而响应能力则取决于具体实现方式，是**延迟复制保持最终一致性**，还是**立即复制快速响应**。
+
+#### 8.Zookeeper工作原理
+
+Zookeeper 的核心是**原子广播**，这个机制保证了**各个Server之间的同步**。实现这个机制的协议叫做**Zab协议**。Zab协议有两种模式，它们分别是**恢复模式（选主）**和**广播模式（同步）**。当服务启动或者在领导者崩溃后，Zab就进入了恢复模式，当领导者被选举出来，且大多数Server完成了和 leader的状态同步以后，恢复模式就结束了。状态同步保证了leader和Server具有相同的系统状态。
+
+#### 9.zookeeper是如何保证事务的顺序一致性的？
+
+zookeeper采用了**递增的事务Id**来标识，所有的proposal（提议）都在被提出的时候加上了zxid，zxid实际上是一个64位的数字，高32位是epoch（时期; 纪元; 世; 新时代）用来标识leader是否发生改变，如果有新的leader产生出来，epoch会自增，**低32位用来递增计数**。当新产生proposal的时候，会依据数据库的两阶段过程，首先会向其他的server发出事务执行请求，如果超过半数的机器都能执行并且能够成功，那么就会开始执行。
+
+#### 10.Zookeeper 下 Server工作状态
+
+每个Server在工作过程中有三种状态： 
+LOOKING：当前Server**不知道leader是谁**，正在搜寻
+LEADING：当前Server即为选举出来的leader
+FOLLOWING：leader已经选举出来，当前Server与之同步
+
+#### 11.zookeeper是如何选取主leader的？
+
+当leader崩溃或者leader失去大多数的follower，这时zk进入恢复模式，恢复模式需要重新选举出一个新的leader，让所有的Server都恢复到一个正确的状态。Zk的选举算法有两种：一种是基于basic paxos实现的，另外一种是基于fast paxos算法实现的。系统默认的选举算法为**fast paxos**。
+
+1、Zookeeper选主流程(basic paxos)
+（1）选举线程由当前Server发起选举的线程担任，其主要功能是对投票结果进行统计，并选出推荐的Server； 
+（2）选举线程首先向所有Server发起一次询问(包括自己)； 
+（3）选举线程收到回复后，验证是否是自己发起的询问(验证zxid是否一致)，然后获取对方的id(myid)，并存储到当前询问对象列表中，最后获取对方提议的leader相关信息(id,zxid)，并将这些信息存储到当次选举的投票记录表中； 
+（4）收到所有Server回复以后，就计算出zxid最大的那个Server，并将这个Server相关信息设置成下一次要投票的Server； 
+（5）线程将当前zxid最大的Server设置为当前Server要推荐的Leader，如果此时获胜的Server获得n/2 + 1的Server票数，设置当前推荐的leader为获胜的Server，将根据获胜的Server相关信息设置自己的状态，否则，继续这个过程，直到leader被选举出来。 通过流程分析我们可以得出：要使Leader获得多数Server的支持，则Server总数必须是奇数2n+1，且存活的Server的数目不得少于n+1. 每个Server启动后都会重复以上流程。在恢复模式下，如果是刚从崩溃状态恢复的或者刚启动的server还会从磁盘快照中恢复数据和会话信息，zk会记录事务日志并定期进行快照，方便在恢复时进行状态恢复。
+
+<div align="center"> <img src="pics/zkLeader1.png"/> </div><br>
+
+2、Zookeeper选主流程(basic paxos)
+fast paxos流程是在选举过程中，某Server首先向所有Server提议自己要成为leader，当其它Server收到提议以后，解决epoch和 zxid的冲突，并接受对方的提议，然后向对方发送接受提议完成的消息，重复这个流程，最后一定能选举出Leader。
+
+<div align="center"> <img src="pics/zkLeader2.png"/> </div><br>
+
+#### 12.Zookeeper同步流程
+
+选完Leader以后，zk就进入状态同步过程。 
+1、Leader等待server连接； 
+2、Follower连接leader，将最大的zxid发送给leader； 
+3、Leader根据follower的zxid确定同步点； 
+4、完成同步后通知follower 已经成为uptodate状态； 
+5、Follower收到uptodate消息后，又可以重新接受client的请求进行服务了。
+
+<div align="center"> <img src="pics/zkSync.png"/> </div><br>
+
+#### 13.分布式通知和协调
+
+对于系统调度来说：操作人员发送通知实际是通过控制台**改变某个节点的状态**，**然后zk将这些变化发送给注册了这个节点的watcher的所有客户端**。
+对于执行情况汇报：每个工作进程都在某个目录下**创建一个临时节点**。**并携带工作的进度数据**，这样**汇总的进程可以监控目录子节点的变化获得工作进度的实时的全局情况**。
+
+#### 14.机器中为什么会有leader？
+
+在分布式环境中，有些业务逻辑只需要集群中的某一台机器进行执行，**其他的机器可以共享这个结果**，这样可以大大**减少重复计算**，**提高性能**，于是就需要进行leader选举。
+
+#### 15.zk节点宕机如何处理？
+
+Zookeeper本身也是集群，推荐配置不少于3个服务器。Zookeeper自身也要保证当一个节点宕机时，其他节点会继续提供服务。
+如果是一个Follower宕机，还有2台服务器提供访问，因为Zookeeper上的数据是有多个副本的，数据并不会丢失；
+如果是一个Leader宕机，Zookeeper会选举出新的Leader。
+ZK集群的机制是只要超过半数的节点正常，集群就能正常提供服务。只有在ZK节点挂得太多，只剩一半或不到一半节点能工作，集群才失效。
+所以
+3个节点的cluster可以挂掉1个节点(leader可以得到2票>1.5)
+2个节点的cluster就不能挂掉任何1个节点了(leader可以得到1票<=1)
+
+#### 16.zookeeper负载均衡和nginx负载均衡区别
+
+zk的负载均衡是可以调控，nginx只是能调权重，其他需要可控的都需要自己写插件；但是nginx的吞吐量比zk大很多，应该说按业务选择用哪种方式。
+
+#### 17.zookeeper watch机制
+
+Watch机制官方声明：一个Watch事件是一个一次性的触发器，当被设置了Watch的数据发生了改变的时候，则服务器将这个改变发送给设置了Watch的客户端，以便通知它们。
+Zookeeper机制的特点：
+1、一次性触发数据发生改变时，一个watcher event会被发送到client，但是client**只会收到一次这样的信息**。
+2、watcher event异步发送watcher的通知事件从server发送到client是**异步**的，这就存在一个问题，不同的客户端和服务器之间通过socket进行通信，由于**网络延迟或其他因素导致客户端在不通的时刻监听到事件**，由于Zookeeper本身提供了**ordering guarantee，即客户端监听事件后，才会感知它所监视znode发生了变化**。所以我们使用Zookeeper不能期望能够监控到节点每次的变化。Zookeeper**只能保证最终的一致性，而无法保证强一致性**。
+3、数据监视Zookeeper有数据监视和子数据监视getdata() and exists()设置数据监视，getchildren()设置了子节点监视。
+4、注册watcher **getData、exists、getChildren**
+5、触发watcher **create、delete、setData**
+6、**setData()**会触发znode上设置的data watch（如果set成功的话）。一个成功的**create()** 操作会触发被创建的znode上的数据watch，以及其父节点上的child watch。而一个成功的**delete()**操作将会同时触发一个znode的data watch和child watch（因为这样就没有子节点了），同时也会触发其父节点的child watch。
+7、当一个客户端**连接到一个新的服务器上**时，watch将会被以任意会话事件触发。当**与一个服务器失去连接**的时候，是无法接收到watch的。而当client**重新连接**时，如果需要的话，所有先前注册过的watch，都会被重新注册。通常这是完全透明的。只有在一个特殊情况下，**watch可能会丢失**：对于一个未创建的znode的exist watch，如果在客户端断开连接期间被创建了，并且随后在客户端连接上之前又删除了，这种情况下，这个watch事件可能会被丢失。
+8、Watch是轻量级的，其实就是本地JVM的**Callback**，服务器端只是存了是否有设置了Watcher的布尔类型
+
+### 3、Netty
+
+https://juejin.im/post/5bdaf8ea6fb9a0227b02275a
+
+#### NIO
+
+上面是一个传统处理http的服务器，但是在高并发的环境下，线程数量会比较多，System load也会比较高，于是就有了NIO。
+
+他并不是Java独有的概念，NIO代表的一个词汇叫着IO多路复用。它是由操作系统提供的系统调用，早期这个操作系统调用的名字是select，但是性能低下，后来渐渐演化成了Linux下的epoll和Mac里的kqueue。我们一般就说是epoll，因为没有人拿苹果电脑作为服务器使用对外提供服务。而Netty就是基于Java NIO技术封装的一套框架。为什么要封装，因为原生的Java NIO使用起来没那么方便，而且还有臭名昭著的bug，Netty把它封装之后，提供了一个易于操作的使用模式和接口，用户使用起来也就便捷多了。
+
+说NIO之前先说一下BIO（Blocking IO）,如何理解这个Blocking呢？
+
+1. 客户端监听（Listen）时，Accept是阻塞的，只有新连接来了，Accept才会返回，主线程才能继
+2. 读写socket时，Read是阻塞的，只有请求消息来了，Read才能返回，子线程才能继续处理
+3. 读写socket时，Write是阻塞的，只有客户端把消息收了，Write才能返回，子线程才能继续读取下一个请求
+
+传统的BIO模式下，从头到尾的所有线程都是阻塞的，这些线程就干等着，占用系统的资源，什么事也不干。
+
+那么NIO是怎么做到非阻塞的呢。它用的是事件机制。它可以用一个线程把Accept，读写操作，请求处理的逻辑全干了。如果什么事都没得做，它也不会死循环，它会将线程休眠起来，直到下一个事件来了再继续干活，这样的一个线程称之为NIO线程。用伪代码表示：
+
+```java
+while true {
+    events = takeEvents(fds)  // 获取事件，如果没有事件，线程就休眠
+    for event in events {
+        if event.isAcceptable {
+            doAccept() // 新链接来了
+        } elif event.isReadable {
+            request = doRead() // 读消息
+            if request.isComplete() {
+                doProcess()
+            }
+        } elif event.isWriteable {
+            doWrite()  // 写消息
+        }
+    }
+}
+```
+
+Netty能够受到青睐的原因有三：
+
+1. **并发高**
+2. **传输快**
+3. **封装好**
+
+#### Netty为什么并发高
+
+​	Netty是一款基于NIO（Nonblocking I/O，非阻塞IO）开发的网络通信框架，对比于BIO（Blocking I/O，阻塞IO），他的并发性能得到了很大提高，两张图让你了解BIO和NIO的区别：
+
+**BIO**
+
+<div align="center"> <img src="pics/BIO.png" width="500px"> </div><br>
+
+<div align="center"> <img src="pics/NIO.png" width="500px"> </div><br>
+
+​	从这两图可以看出，NIO的单线程能处理连接的数量比BIO要高出很多，而为什么单线程能处理更多的连接呢？原因就是图二中出现的`Selector`。
+ 	当一个连接建立之后，他有两个步骤要做，第一步是接收完客户端发过来的全部数据，第二步是服务端处理完请求业务之后返回response给客户端。NIO和BIO的区别主要是在第一步。
+ 在BIO中，等待客户端发数据这个过程是阻塞的，这样就造成了一个线程只能处理一个请求的情况，而机器能支持的最大线程数是有限的，这就是为什么BIO不能支持高并发的原因。
+ 	而NIO中，当一个Socket建立好之后，Thread并不会阻塞去接受这个Socket，而是将这个请求交给Selector，Selector会不断的去遍历所有的Socket，一旦有一个Socket建立完成，他会通知Thread，然后Thread处理完数据再返回给客户端——*这个过程是阻塞的*，这样就能让一个Thread处理更多的请求了。
+
+#### 零拷贝
+
+##### 传统意义的拷贝
+
+是在发送数据的时候，传统的实现方式是：
+
+1. `File.read(bytes)`
+
+2. `Socket.send(bytes)`
+
+   这种方式需要四次数据拷贝和四次上下文切换：
+
+3. 数据从磁盘读取到内核的read buffer
+
+4. 数据从内核缓冲区拷贝到用户缓冲区
+
+5. 数据从用户缓冲区拷贝到内核的socket buffer
+
+6. 数据从内核的socket buffer拷贝到网卡接口（硬件）的缓冲区
+
+<div align="center"> <img src="pics/copy.png" width="500px"> </div><br>
+
+##### 零拷贝的概念
+
+明显上面的第二步和第三步是没有必要的，通过java的FileChannel.transferTo方法，可以避免上面两次多余的拷贝（当然这需要底层操作系统支持）
+
+1. 调用transferTo,数据从文件由DMA引擎拷贝到内核read buffer
+2. 接着DMA从内核read buffer将数据拷贝到网卡接口buffer
+
+上面的两次操作都不需要CPU参与，所以就达到了零拷贝。
+
+<div align="center"> <img src="pics/zero-copy.png" width="600px"> </div><br>
+
+##### Netty中的零拷贝
+
+主要体现在三个方面：
+
+**1、bytebuffer**
+
+Netty发送和接收消息主要使用bytebuffer，bytebuffer使用对外内存（DirectMemory）直接进行Socket读写。
+
+原因：如果使用传统的堆内存进行Socket读写，JVM会将堆内存buffer拷贝一份到直接内存中然后再写入socket，多了一次缓冲区的内存拷贝。DirectMemory中可以直接通过DMA发送到网卡接口
+
+**2、Composite Buffers**
+
+传统的ByteBuffer，如果需要将两个ByteBuffer中的数据组合到一起，我们需要首先创建一个size=size1+size2大小的新的数组，然后将两个数组中的数据拷贝到新的数组中。但是使用Netty提供的组合ByteBuf，就可以避免这样的操作，因为CompositeByteBuf并没有真正将多个Buffer组合起来，而是保存了它们的引用，从而避免了数据的拷贝，实现了零拷贝。
+
+**3、对于FileChannel.transferTo的使用**
+
+Netty中使用了FileChannel的transferTo方法，该方法依赖于操作系统实现零拷贝。
+
+#### 什么是TCP 粘包/拆包
+
+##### 现象
+
+先看如下代码，这个代码是使用netty在client端重复写100次数据给server端，ByteBuf是netty的一个字节容器，里面存放是的需要发送的数据
+
+```java
+public class FirstClientHandler extends ChannelInboundHandlerAdapter {    
+    @Override    
+    public void channelActive(ChannelHandlerContext ctx) {       
+        for (int i = 0; i < 1000; i++) {            
+            ByteBuf buffer = getByteBuf(ctx);            
+            ctx.channel().writeAndFlush(buffer);        
+        }    
+    }    
+    private ByteBuf getByteBuf(ChannelHandlerContext ctx) {        
+        byte[] bytes = "你好，我的名字是1234567!".getBytes(Charset.forName("utf-8"));        
+        ByteBuf buffer = ctx.alloc().buffer();        
+        buffer.writeBytes(bytes);        
+        return buffer;    
+    }
+}复制代码
+```
+
+从client端读取到的数据为：
+
+<div align="center"> <img src="pics/zhanbao1.jpeg" width="1000px"> </div><br/>
+
+从服务端的控制台输出可以看出，存在三种类型的输出
+
+1. 一种是正常的字符串输出。
+2. 一种是多个字符串“粘”在了一起，我们定义这种 ByteBuf 为粘包。
+3. 一种是一个字符串被“拆”开，形成一个破碎的包，我们定义这种 ByteBuf 为半包。
+
+##### 透过现象分析原因
+
+​	应用层面使用了Netty，但是对于操作系统来说，只认TCP协议，尽管我们的应用层是按照 ByteBuf 为 单位来发送数据，server按照Bytebuf读取，但是到了底层操作系统仍然是按照字节流发送数据，因此，数据到了服务端，也是按照字节流的方式读入，然后到了 Netty 应用层面，重新拼装成 ByteBuf，而这里的 ByteBuf 与客户端按顺序发送的 ByteBuf 可能是不对等的。因此，我们需要在客户端根据自定义协议来组装我们应用层的数据包，然后在服务端根据我们的应用层的协议来组装数据包，这个过程通常在服务端称为拆包，而在客户端称为粘包。 
+
+​	拆包和粘包是相对的，一端粘了包，另外一端就需要将粘过的包拆开，发送端将三个数据包粘成两个 TCP 数据包发送到接收端，接收端就需要根据应用协议将两个数据包重新组装成三个数据包。
+
+##### 如何解决
+
+​	在没有 Netty 的情况下，用户如果自己需要拆包，基本原理就是不断从 TCP 缓冲区中读取数据，每次读取完都需要判断是否是一个完整的数据包 如果当前读取的数据不足以拼接成一个完整的业务数据包，那就保留该数据，继续从 TCP 缓冲区中读取，直到得到一个完整的数据包。 如果当前读到的数据加上已经读取的数据足够拼接成一个数据包，那就将已经读取的数据拼接上本次读取的数据，构成一个完整的业务数据包传递到业务逻辑，多余的数据仍然保留，以便和下次读到的数据尝试拼接。 
+
+而在Netty中，已经造好了许多类型的拆包器，我们直接用就好：
+
+<div align="center"> <img src="pics/zhanbao2.png" width="900px"> </div><br/>
+
+选好拆包器后，在代码中client段和server端将拆包器加入到chanelPipeline之中就好了:
+
+如上实例中：
+
+客户端：
+
+```java
+ch.pipeline().addLast(new FixedLengthFrameDecoder(31));复制代码
+```
+
+服务端：
+
+```java
+ch.pipeline().addLast(new FixedLengthFrameDecoder(31));复制代码
+```
+
+<div align="center"> <img src="pics/zhanbao3.jpeg" width="900px"> </div><br/
+
+#### 模块组件
+
+**Bootstrap、ServerBootstrap**
+
+Bootstrap  意思是引导，一个 Netty 应用通常由一个 Bootstrap 开始，主要作用是配置整个 Netty 程序，串联各个组件，Netty 中  Bootstrap 类是客户端程序的启动引导类，ServerBootstrap 是服务端启动引导类。
+
+**Future、ChannelFuture**
+
+正如前面介绍，在 Netty 中所有的 IO 操作都是异步的，不能立刻得知消息是否被正确处理。
+
+但是可以过一会等它执行完成或者直接注册一个监听，具体的实现就是通过 Future 和 ChannelFutures，他们可以注册一个监听，当操作执行成功或失败时监听会自动触发注册的监听事件。
+
+**Channel**
+
+Netty 网络通信的组件，能够用于执行网络 I/O 操作。Channel 为用户提供：
+
+- 当前网络连接的通道的状态（例如是否打开？是否已连接？）
+- 网络连接的配置参数 （例如接收缓冲区大小）
+- 提供异步的网络 I/O 操作(如建立连接，读写，绑定端口)，异步调用意味着任何 I/O  调用都将立即返回，并且不保证在调用结束时所请求的 I/O 操作已完成。 调用立即返回一个 ChannelFuture 实例，通过注册监听器到  ChannelFuture 上，可以 I/O 操作成功、失败或取消时回调通知调用方。
+- 支持关联 I/O 操作与对应的处理程序。
+
+不同协议、不同的阻塞类型的连接都有不同的 Channel 类型与之对应。下面是一些常用的 Channel 类型：
+
+- NioSocketChannel，异步的客户端 TCP Socket 连接。
+- NioServerSocketChannel，异步的服务器端 TCP Socket 连接。
+- NioDatagramChannel，异步的 UDP 连接。
+- NioSctpChannel，异步的客户端 Sctp 连接。
+- NioSctpServerChannel，异步的 Sctp 服务器端连接，这些通道涵盖了 UDP 和 TCP 网络 IO 以及文件 IO。
+
+**Selector**
+
+Netty 基于 Selector 对象实现 I/O 多路复用，通过 Selector 一个线程可以监听多个连接的 Channel 事件。
+
+当向一个 Selector 中注册 Channel 后，Selector 内部的机制就可以自动不断地查询(Select) 这些注册的 Channel 是否有已就绪的 I/O 事件（例如可读，可写，网络连接完成等），这样程序就可以很简单地使用一个线程高效地管理多个 Channel 。
+
+**NioEventLoop**
+
+NioEventLoop 中维护了一个线程和任务队列，支持异步提交执行任务，线程启动时会调用 NioEventLoop 的 run 方法，执行 I/O 任务和非 I/O 任务：
+
+- I/O 任务，即 selectionKey 中 ready 的事件，如 accept、connect、read、write 等，由 processSelectedKeys 方法触发。
+- 非 IO 任务，添加到 taskQueue 中的任务，如 register0、bind0 等任务，由 runAllTasks 方法触发。
+
+两种任务的执行时间比由变量 ioRatio 控制，默认为 50，则表示允许非 IO 任务执行的时间与 IO 任务的执行时间相等。
+
+**NioEventLoopGroup**
+
+NioEventLoopGroup，主要管理 eventLoop 的生命周期，可以理解为一个线程池，内部维护了一组线程，每个线程(NioEventLoop)负责处理多个 Channel 上的事件，而一个 Channel 只对应于一个线程。
+
+**ChannelHandler**
+
+ChannelHandler 是一个接口，处理 I/O 事件或拦截 I/O 操作，并将其转发到其 ChannelPipeline(业务处理链)中的下一个处理程序。
+
+ChannelHandler 本身并没有提供很多方法，因为这个接口有许多的方法需要实现，方便使用期间，可以继承它的子类：
+
+- ChannelInboundHandler 用于处理入站 I/O 事件。
+- ChannelOutboundHandler 用于处理出站 I/O 操作。
+
+或者使用以下适配器类：
+
+- ChannelInboundHandlerAdapter 用于处理入站 I/O 事件。
+- ChannelOutboundHandlerAdapter 用于处理出站 I/O 操作。
+- ChannelDuplexHandler 用于处理入站和出站事件。
+
+**ChannelHandlerContext**
+
+保存 Channel 相关的所有上下文信息，同时关联一个 ChannelHandler 对象。
+
+**ChannelPipline**
+
+保存 ChannelHandler 的 List，用于处理或拦截 Channel 的入站事件和出站操作。
+
+ChannelPipeline 实现了一种高级形式的拦截过滤器模式，使用户可以完全控制事件的处理方式，以及 Channel 中各个的 ChannelHandler 如何相互交互。
+
+下图引用 Netty 的 Javadoc 4.1 中 ChannelPipeline 的说明，描述了 ChannelPipeline 中 ChannelHandler 通常如何处理 I/O 事件。
+
+I/O 事件由 ChannelInboundHandler 或 ChannelOutboundHandler 处理，并通过调用 ChannelHandlerContext 中定义的事件传播方法。
+
+例如 ChannelHandlerContext.fireChannelRead（Object）和 ChannelOutboundInvoker.write（Object）转发到其最近的处理程序。
+
+<div align="center"> <img src="pics/nettyChannel.jpeg" width="600px"> </div><br/>
+
+​	入站事件由自下而上方向的入站处理程序处理，如图左侧所示。入站 Handler 处理程序通常处理由图底部的 I/O 线程生成的入站数据。
+
+​	通常通过实际输入操作（例如 SocketChannel.read（ByteBuffer））从远程读取入站数据。
+
+​	出站事件由上下方向处理，如图右侧所示。出站 Handler 处理程序通常会生成或转换出站传输，例如 write 请求。
+
+​	I/O 线程通常执行实际的输出操作，例如 SocketChannel.write（ByteBuffer）。
+
+​	在 Netty 中每个 Channel 都有且仅有一个 ChannelPipeline 与之对应，它们的组成关系如下：
+
+<div align="center"> <img src="pics/nettyChannel1.jpeg" width="750px"> </div><br/>
+
+​	一个Channel  包含了一个 ChannelPipeline，而 ChannelPipeline 中又维护了一个由 ChannelHandlerContext  组成的双向链表，并且每个 ChannelHandlerContext 中又关联着一个 ChannelHandler。
+
+​	入站事件和出站事件在一个双向链表中，入站事件会从链表 head 往后传递到最后一个入站的 handler，出站事件会从链表 tail 往前传递到最前一个出站的 handler，两种类型的 handler 互不干扰。
+
+#### 一、Netty框架的工作原理
+
+```java
+public static void main(String[] args) {
+	// 创建mainReactor
+	NioEventLoopGroup boosGroup = newNioEventLoopGroup();
+	// 创建工作线程组
+	NioEventLoopGroup workerGroup = newNioEventLoopGroup();
+
+	finalServerBootstrap serverBootstrap = newServerBootstrap();
+	serverBootstrap
+	// 组装NioEventLoopGroup
+	.group(boosGroup, workerGroup)
+	// 设置channel类型为NIO类型
+	.channel(NioServerSocketChannel.class)
+	// 设置连接配置参数
+	.option(ChannelOption.SO_BACKLOG, 1024)
+	.childOption(ChannelOption.SO_KEEPALIVE, true)
+	.childOption(ChannelOption.TCP_NODELAY, true)
+	// 配置入站、出站事件handler
+	.childHandler(newChannelInitializer<NioSocketChannel>() {
+		@Override
+		protected void initChannel(NioSocketChannel ch) {
+			// 配置入站、出站事件channel
+			ch.pipeline().addLast(...);
+			ch.pipeline().addLast(...);
+		}
+	});
+
+	// 绑定端口
+	intport = 8080;
+	serverBootstrap.bind(port).addListener(future -> {
+        if(future.isSuccess()) {
+            System.out.println(newDate() + ": 端口["+ port + "]绑定成功!");
+        } else{
+            System.err.println("端口["+ port + "]绑定失败!");
+        }
+	});
+}
+```
+
+**基本过程描述如下：**
+
+1. 初始化创建 2 个 NioEventLoopGroup：其中 boosGroup 用于 Accetpt 连接建立事件并分发请求，workerGroup 用于处理 I/O 读写事件和业务逻辑。
+2. 基于 ServerBootstrap(服务端启动引导类)：配置 EventLoopGroup、Channel 类型，连接参数、配置入站、出站事件 handler。
+3. 绑定端口：开始工作。
+
+#### 二、Netty线程模型- Reactor 模型
+
+**一个NIO线程+一个accept线程：**
+
+<div align="center"> <img src="pics/nio4.png" width="600px"> </div><br>
+
+
+
+**Reactor多线程模型**
+
+<div align="center"> <img src="pics/nio2.png" width="600px"> </div><br>
+
+**Reactor主从模型**
+
+<div align="center"> <img src="pics/nio3.png" width="600px"> </div><br>
+
+**Netty-Reactor主从模型详解**
+
+<div align="center"> <img src="pics/netty-reactor.jpg" width="600px"> </div><br>
+
+Server 端包含 1 个 Boss NioEventLoopGroup 和 1 个 Worker NioEventLoopGroup。
+
+NioEventLoopGroup 相当于 1 个事件循环组，这个组里包含多个事件循环 NioEventLoop，每个 NioEventLoop 包含 1 个 Selector 和 1 个事件循环线程。
+
+**每个 Boss NioEventLoop 循环执行的任务包含 3 步：**
+
+1. 轮询 Accept 事件；
+2. 处理 Accept I/O 事件，与 Client 建立连接，生成 NioSocketChannel，并将 NioSocketChannel 注册到某个 Worker NioEventLoop 的 Selector 上；
+3. 处理任务队列中的任务，runAllTasks。任务队列中的任务包括用户调用 eventloop.execute 或 schedule 执行的任务，或者其他线程提交到该 eventloop 的任务。
+
+**每个 Worker NioEventLoop 循环执行的任务包含 3 步：**
+
+1. 轮询 Read、Write 事件；
+2. 处理 I/O 事件，即 Read、Write 事件，在 NioSocketChannel 可读、可写事件发生时进行处理；
+3. 处理任务队列中的任务，runAllTasks。
+
+### 4、Jmq、Ump
+
+https://www.jianshu.com/p/689ce4205021
+
+https://tech.meituan.com/2016/07/01/mq-design.html
+
+我们来看一个最简单的架构模型：
+
+[![img](https://github.com/jasonGeng88/blog/raw/master/201705/assets/mq_01.png)](https://github.com/jasonGeng88/blog/blob/master/201705/assets/mq_01.png)
+
+- Producer：消息生产者，负责产生和发送消息到 Broker；
+- Broker：消息处理中心。负责消息存储、确认、重试等，一般其中会包含多个 queue；
+- Consumer：消息消费者，负责从 Broker 中获取消息，并进行相应处理；
+
+#### 为什么使用消息队列
+
+其实就是问问你消息队列都有哪些使用场景，然后你项目里具体是什么场景，说说你在这个场景里用消息队列是什么？
+
+面试官问你这个问题，**期望的一个回答**是说，你们公司有个什么**业务场景**，这个业务场景有个什么技术挑战，如果不用 MQ 可能会很麻烦，但是你现在用了 MQ 之后带给了你很多的好处。
+
+先说一下消息队列常见的使用场景吧，其实场景有很多，但是比较核心的有 3 个：**解耦**、**异步**、**削峰**。
+
+##### 解耦
+
+看这么个场景。A 系统发送数据到 BCD 三个系统，通过接口调用发送。如果 E 系统也要这个数据呢？那如果 C 系统现在不需要了呢？A 系统负责人几乎崩溃......
+
+[![mq-1](https://github.com/Fi-Null/advanced-java/raw/master/images/mq-1.png)](https://github.com/Fi-Null/advanced-java/blob/master/images/mq-1.png)
+
+在这个场景中，A 系统跟其它各种乱七八糟的系统严重耦合，A 系统产生一条比较关键的数据，很多系统都需要 A 系统将这个数据发送过来。A 系统要时时刻刻考虑 BCDE 四个系统如果挂了该咋办？要不要重发，要不要把消息存起来？头发都白了啊！
+
+如果使用 MQ，A 系统产生一条数据，发送到 MQ 里面去，哪个系统需要数据自己去 MQ 里面消费。如果新系统需要数据，直接从 MQ 里消费即可；如果某个系统不需要这条数据了，就取消对 MQ 消息的消费即可。这样下来，A 系统压根儿不需要去考虑要给谁发送数据，不需要维护这个代码，也不需要考虑人家是否调用成功、失败超时等情况。
+
+[![mq-2](https://github.com/Fi-Null/advanced-java/raw/master/images/mq-2.png)](https://github.com/Fi-Null/advanced-java/blob/master/images/mq-2.png)
+
+**总结**：通过一个 MQ，Pub/Sub 发布订阅消息这么一个模型，A 系统就跟其它系统彻底解耦了。
+
+**面试技巧**：你需要去考虑一下你负责的系统中是否有类似的场景，就是一个系统或者一个模块，调用了多个系统或者模块，互相之间的调用很复杂，维护起来很麻烦。但是其实这个调用是不需要直接同步调用接口的，如果用 MQ 给它异步化解耦，也是可以的，你就需要去考虑在你的项目里，是不是可以运用这个 MQ 去进行系统的解耦。在简历中体现出来这块东西，用 MQ 作解耦。
+
+##### 异步
+
+再来看一个场景，A 系统接收一个请求，需要在自己本地写库，还需要在 BCD 三个系统写库，自己本地写库要 3ms，BCD 三个系统分别写库要 300ms、450ms、200ms。最终请求总延时是 3 + 300 + 450 + 200 = 953ms，接近 1s，用户感觉搞个什么东西，慢死了慢死了。用户通过浏览器发起请求，等待个 1s，这几乎是不可接受的。
+
+[![mq-3](https://github.com/Fi-Null/advanced-java/raw/master/images/mq-3.png)](https://github.com/Fi-Null/advanced-java/blob/master/images/mq-3.png)
+
+一般互联网类的企业，对于用户直接的操作，一般要求是每个请求都必须在 200 ms 以内完成，对用户几乎是无感知的。
+
+如果**使用 MQ**，那么 A 系统连续发送 3 条消息到 MQ 队列中，假如耗时 5ms，A 系统从接受一个请求到返回响应给用户，总时长是 3 + 5 = 8ms，对于用户而言，其实感觉上就是点个按钮，8ms 以后就直接返回了，爽！网站做得真好，真快！
+
+[![mq-4](https://github.com/Fi-Null/advanced-java/raw/master/images/mq-4.png)](https://github.com/Fi-Null/advanced-java/blob/master/images/mq-4.png)
+
+##### 削峰
+
+每天 0:00 到 12:00，A 系统风平浪静，每秒并发请求数量就 50 个。结果每次一到 12:00 ~ 13:00 ，每秒并发请求数量突然会暴增到 5k+ 条。但是系统是直接基于 MySQL 的，大量的请求涌入 MySQL，每秒钟对 MySQL 执行约 5k 条 SQL。
+
+一般的 MySQL，扛到每秒 2k 个请求就差不多了，如果每秒请求到 5k 的话，可能就直接把 MySQL 给打死了，导致系统崩溃，用户也就没法再使用系统了。
+
+但是高峰期一过，到了下午的时候，就成了低峰期，可能也就 1w 的用户同时在网站上操作，每秒中的请求数量可能也就 50 个请求，对整个系统几乎没有任何的压力。
+
+[![mq-5](https://github.com/Fi-Null/advanced-java/raw/master/images/mq-5.png)](https://github.com/Fi-Null/advanced-java/blob/master/images/mq-5.png)
+
+如果使用 MQ，每秒 5k 个请求写入 MQ，A 系统每秒钟最多处理 2k 个请求，因为 MySQL 每秒钟最多处理 2k 个。A 系统从 MQ 中慢慢拉取请求，每秒钟就拉取 2k 个请求，不要超过自己每秒能处理的最大请求数量就 ok，这样下来，哪怕是高峰期的时候，A 系统也绝对不会挂掉。而 MQ 每秒钟 5k 个请求进来，就 2k 个请求出去，结果就导致在中午高峰期（1 个小时），可能有几十万甚至几百万的请求积压在 MQ 中。
+
+[![mq-6](https://github.com/Fi-Null/advanced-java/raw/master/images/mq-6.png)](https://github.com/Fi-Null/advanced-java/blob/master/images/mq-6.png)
+
+这个短暂的高峰期积压是 ok 的，因为高峰期过了之后，每秒钟就 50 个请求进 MQ，但是 A 系统依然会按照每秒 2k 个请求的速度在处理。所以说，只要高峰期一过，A 系统就会快速将积压的消息给解决掉。
+
+##### 消息通讯
+
+https://cloud.tencent.com/developer/article/1006035
+
+消息队列包括两种模式，点对点模式（point to point， queue）和发布/订阅模式（publish/subscribe，topic）。
+
+###### 3.1 点对点模式
+
+点对点模式下包括三个角色：
+
+- 消息队列
+- 发送者 (生产者)
+- 接收者（消费者）
+
+
+
+![img](https://blog-10039692.file.myqcloud.com/1506330130593_2564_1506330132919.png)
+
+消息发送者生产消息发送到queue中，然后消息接收者从queue中取出并且消费消息。消息被消费以后，queue中不再有存储，所以消息接收者不可能消费到已经被消费的消息。
+
+点对点模式特点：
+
+- 每个消息只有一个接收者（Consumer）(即一旦被消费，消息就不再在消息队列中)；
+- 发送者和接收者间没有依赖性，发送者发送消息之后，不管有没有接收者在运行，都不会影响到发送者下次发送消息；
+- 接收者在成功接收消息之后需向队列应答成功，以便消息队列删除当前接收的消息；
+
+###### 3.2 发布/订阅模式
+
+发布/订阅模式下包括三个角色：
+
+- 角色主题（Topic）
+- 发布者(Publisher)
+- 订阅者(Subscriber)
+
+
+
+![img](https://blog-10039692.file.myqcloud.com/1506330158945_9538_1506330161280.png)
+
+发布者将消息发送到Topic,系统将这些消息传递给多个订阅者。
+
+发布/订阅模式特点：
+
+- 每个消息可以有多个订阅者；
+- 发布者和订阅者之间有时间上的依赖性。针对某个主题（Topic）的订阅者，它必须创建一个订阅者之后，才能消费发布者的消息。
+- 为了消费消息，订阅者需要提前订阅该角色主题，并保持在线运行；
+
+##### 消息队列有什么优缺点
+
+优点上面已经说了，就是**在特殊场景下有其对应的好处**，**解耦**、**异步**、**削峰**。
+
+缺点有以下几个：
+
+- 系统可用性降低
+  系统引入的外部依赖越多，越容易挂掉。本来你就是 A 系统调用 BCD 三个系统的接口就好了，人 ABCD 四个系统好好的，没啥问题，你偏加个 MQ 进来，万一 MQ 挂了咋整，MQ 一挂，整套系统崩溃的，你不就完了？如何保证消息队列的高可用，可以[点击这里查看](https://github.com/Fi-Null/advanced-java/blob/master/docs/high-concurrency/how-to-ensure-high-availability-of-message-queues.md)。
+- 系统复杂度提高
+  硬生生加个 MQ 进来，你怎么[保证消息没有重复消费](https://github.com/Fi-Null/advanced-java/blob/master/docs/high-concurrency/how-to-ensure-that-messages-are-not-repeatedly-consumed.md)？怎么[处理消息丢失的情况](https://github.com/Fi-Null/advanced-java/blob/master/docs/high-concurrency/how-to-ensure-the-reliable-transmission-of-messages.md)？怎么保证消息传递的顺序性？头大头大，问题一大堆，痛苦不已。
+- 一致性问题
+  A 系统处理完了直接返回成功了，人都以为你这个请求就成功了；但是问题是，要是 BCD 三个系统那里，BD 两个系统写库成功了，结果 C 系统写库失败了，咋整？你这数据就不一致了。
+
+所以消息队列实际是一种非常复杂的架构，你引入它有很多好处，但是也得针对它带来的坏处做各种额外的技术方案和架构来规避掉，做好之后，你会发现，妈呀，系统复杂度提升了一个数量级，也许是复杂了 10 倍。但是关键时刻，用，还是得用的。
+
+#### 如何保证消息队列的高可用？
+
+##### Kafka 的高可用性
+
+Kafka 一个最基本的架构认识：由多个 broker 组成，每个 broker 是一个节点；你创建一个 topic，这个 topic 可以划分为多个 partition，每个 partition 可以存在于不同的 broker 上，每个 partition 就放一部分数据。
+
+这就是**天然的分布式消息队列**，就是说一个 topic 的数据，是**分散放在多个机器上的，每个机器就放一部分数据**。
+
+实际上 RabbmitMQ 之类的，并不是分布式消息队列，它就是传统的消息队列，只不过提供了一些集群、HA(High Availability, 高可用性) 的机制而已，因为无论怎么玩儿，RabbitMQ 一个 queue 的数据都是放在一个节点里的，镜像集群下，也是每个节点都放这个 queue 的完整数据。
+
+Kafka 0.8 以前，是没有 HA 机制的，就是任何一个 broker 宕机了，那个 broker 上的 partition 就废了，没法写也没法读，没有什么高可用性可言。
+
+比如说，我们假设创建了一个 topic，指定其 partition 数量是 3 个，分别在三台机器上。但是，如果第二台机器宕机了，会导致这个 topic 的 1/3 的数据就丢了，因此这个是做不到高可用的。
+
+[![kafka-before](https://github.com/Fi-Null/advanced-java/raw/master/images/kafka-before.png)](https://github.com/Fi-Null/advanced-java/blob/master/images/kafka-before.png)
+
+Kafka 0.8 以后，提供了 HA 机制，就是 replica（复制品） 副本机制。每个 partition 的数据都会同步到其它机器上，形成自己的多个 replica 副本。所有 replica 会选举一个 leader 出来，那么生产和消费都跟这个 leader 打交道，然后其他 replica 就是 follower。写的时候，leader 会负责把数据同步到所有 follower 上去，读的时候就直接读 leader 上的数据即可。只能读写 leader？很简单，**要是你可以随意读写每个 follower，那么就要 care 数据一致性的问题**，系统复杂度太高，很容易出问题。Kafka 会均匀地将一个 partition 的所有 replica 分布在不同的机器上，这样才可以提高容错性。
+
+[![kafka-after](https://github.com/Fi-Null/advanced-java/raw/master/images/kafka-after.png)](https://github.com/Fi-Null/advanced-java/blob/master/images/kafka-after.png)
+
+这么搞，就有所谓的**高可用性**了，因为如果某个 broker 宕机了，没事儿，那个 broker上面的 partition 在其他机器上都有副本的，如果这上面有某个 partition 的 leader，那么此时会从 follower 中**重新选举**一个新的 leader 出来，大家继续读写那个新的 leader 即可。这就有所谓的高可用性了。
+
+**写数据**的时候，生产者就写 leader，然后 leader 将数据落地写本地磁盘，接着其他 follower 自己主动从 leader 来 pull 数据。一旦所有 follower 同步好数据了，就会发送 ack 给 leader，leader 收到所有 follower 的 ack 之后，就会返回写成功的消息给生产者。（当然，这只是其中一种模式，还可以适当调整这个行为）
+
+**消费**的时候，只会从 leader 去读，但是只有当一个消息已经被所有 follower 都同步成功返回 ack 的时候，这个消息才会被消费者读到。
+
+看到这里，相信你大致明白了 Kafka 是如何保证高可用机制的了，对吧？不至于一无所知，现场还能给面试官画画图。要是遇上面试官确实是 Kafka 高手，深挖了问，那你只能说不好意思，太深入的你没研究过。
+
+#### 如何保证消息不被重复消费？或者说，如何保证消息消费的幂等性？
+
+上文谈到重复消息是不可能100%避免的，除非可以允许丢失，那么，顺序消息能否100%满足呢? 答案是可以，但条件更为苛刻：
+
+1. 允许消息丢失。
+2. 从发送方到服务方到接受者都是单点单线程。
+
+所以绝对的顺序消息基本上是不能实现的，当然在METAQ/Kafka等pull模型的消息队列中，单线程生产/消费，排除消息丢失，也是一种顺序消息的解决方案。 一般来讲，一个主流消息队列的设计范式里，应该是不丢消息的前提下，尽量减少重复消息，不保证消息的投递顺序。 谈到重复消息，主要是两个话题：
+
+1. 如何鉴别消息重复，并幂等的处理重复消息。
+2. 一个消息队列如何尽量减少重复消息的投递。
+
+先来看看第一个话题，每一个消息应该有它的唯一身份。不管是业务方自定义的，还是根据IP/PID/时间戳生成的MessageId，如果有地方记录这个MessageId，消息到来是能够进行比对就 能完成重复的鉴定。数据库的唯一键/bloom filter/分布式KV中的key，都是不错的选择。由于消息不能被永久存储，所以理论上都存在消息从持久化存储移除的瞬间上游还在投递的可能（上游因种种原因投递失败，不停重试，都到了下游清理消息的时间）。这种事情都是异常情况下才会发生的，毕竟是小众情况。两分钟消息都还没送达，多送一次又能怎样呢？幂等的处理消息是一门艺术，因为种种原因重复消息或者错乱的消息还是来到了，说两种通用的解决方案： 1. 版本号。 2. 状态机。
+
+##### 版本号
+
+举个简单的例子，一个产品的状态有上线/下线状态。如果消息1是下线，消息2是上线。不巧消息1判重失败，被投递了两次，且第二次发生在2之后，如果不做重复性判断，显然最终状态是错误的。 但是，如果每个消息自带一个版本号。上游发送的时候，标记消息1版本号是1，消息2版本号是2。如果再发送下线消息，则版本号标记为3。下游对于每次消息的处理，同时维护一个版本号。 每次只接受比当前版本号大的消息。初始版本为0，当消息1到达时，将版本号更新为1。消息2到来时，因为版本号>1.可以接收，同时更新版本号为2.当另一条下线消息到来时，如果版本号是3.则是真实的下线消息。如果是1，则是重复投递的消息。 如果业务方只关心消息重复不重复，那么问题就已经解决了。但很多时候另一个头疼的问题来了，就是消息顺序如果和想象的顺序不一致。比如应该的顺序是12，到来的顺序是21。则最后会发生状态错误。 参考TCP/IP协议，如果想让乱序的消息最后能够正确的被组织，那么就应该只接收比当前版本号大一的消息。并且在一个session周期内要一直保存各个消息的版本号。 如果到来的顺序是21，则先把2存起来，待1到来后，先处理1，再处理2，这样重复性和顺序性要求就都达到了。
+
+##### 状态机
+
+基于版本号来处理重复和顺序消息听起来是个不错的主意，但凡事总有瑕疵。使用版本号的最大问题是：
+
+1. 对发送方必须要求消息带业务版本号。
+2. 下游必须存储消息的版本号，对于要严格保证顺序的。
+
+还不能只存储最新的版本号的消息，要把乱序到来的消息都存储起来。而且必须要对此做出处理。试想一个永不过期的”session”，比如一个物品的状态，会不停流转于上下线。那么中间环节的所有存储 就必须保留，直到在某个版本号之前的版本一个不丢的到来，成本太高。 就刚才的场景看，如果消息没有版本号，该怎么解决呢？业务方只需要自己维护一个状态机，定义各种状态的流转关系。例如，”下线”状态只允许接收”上线”消息，“上线”状态只能接收“下线消息”，如果上线收到上线消息，或者下线收到下线消息，在消息不丢失和上游业务正确的前提下。要么是消息发重了，要么是顺序到达反了。这时消费者只需要把“我不能处理这个消息”告诉投递者，要求投递者过一段时间重发即可。而且重发一定要有次数限制，比如5次，避免死循环，就解决了。 举例子说明，假设产品本身状态是下线，1是上线消息，2是下线消息，3是上线消息，正常情况下，消息应该的到来顺序是123，但实际情况下收到的消息状态变成了3123。 那么下游收到3消息的时候，判断状态机流转是下线->上线，可以接收消息。然后收到消息1，发现是上线->上线，拒绝接收，要求重发。然后收到消息2，状态是上线->下线，于是接收这个消息。 此时无论重发的消息1或者3到来，还是可以接收。另外的重发，在一定次数拒绝后停止重发，业务正确。
+
+所以第二个问题来了，怎么保证消息队列消费的幂等性？
+
+其实还是得结合业务来思考，我这里给几个思路：
+
+- 比如你拿个数据要写库，你先根据主键查一下，如果这数据都有了，你就别插入了，update 一下好吧。
+- 比如你是写 Redis，那没问题了，反正每次都是 set，天然幂等性。
+- 比如你不是上面两个场景，那做的稍微复杂一点，你需要让生产者发送每条数据的时候，里面加一个全局唯一的 id，类似订单 id 之类的东西，然后你这里消费到了之后，先根据这个 id 去比如 Redis 里查一下，之前消费过吗？如果没有消费过，你就处理，然后这个 id 写 Redis。如果消费过了，那你就别处理了，保证别重复处理相同的消息即可。
+- 比如基于数据库的唯一键来保证重复数据不会重复插入多条。因为有唯一键约束了，重复数据插入只会报错，不会导致数据库中出现脏数据。
+
+[![mq-11](https://github.com/Fi-Null/advanced-java/raw/master/images/mq-11.png)](https://github.com/Fi-Null/advanced-java/blob/master/images/mq-11.png)
+
+当然，如何保证 MQ 的消费是幂等性的，需要结合具体的业务来看。
+
+#### 如何保证消息的可靠性传输？或者说，如何处理消息丢失的问题？
+
+这是个激动人心的话题，完全不丢消息，究竟可不可能？答案是，完全可能，前提是消息可能会重复，并且，在异常情况下，要接受消息的延迟。 方案说简单也简单，就是每当要发生不可靠的事情（RPC等）之前，先将消息落地，然后发送。当失败或者不知道成功失败（比如超时）时，消息状态是待发送，定时任务不停轮询所有待发送消息，最终一定可以送达。 具体来说：
+
+1. producer往broker发送消息之前，需要做一次落地。
+2. 请求到server后，server确保数据落地后再告诉客户端发送成功。
+3. 支持广播的消息队列需要对每个待发送的endpoint，持久化一个发送状态，直到所有endpoint状态都OK才可删除消息。
+
+对于各种不确定（超时、down机、消息没有送达、送达后数据没落地、数据落地了回复没收到），其实对于发送方来说，都是一件事情，就是消息没有送达。 重推消息所面临的问题就是消息重复。重复和丢失就像两个噩梦，你必须要面对一个。好在消息重复还有处理的机会，消息丢失再想找回就难了。 Anyway，作为一个成熟的消息队列，应该尽量在各个环节减少重复投递的可能性，不能因为重复有解决方案就放纵的乱投递。 最后说一句，不是所有的系统都要求最终一致性或者可靠投递，比如一个论坛系统、一个招聘系统。一个重复的简历或话题被发布，可能比丢失了一个发布显得更让用户无法接受。不断重复一句话，任何基础组件要服务于业务场景。
+
+#### 如何解决消息队列的延时以及过期失效问题？消息队列满了以后该怎么处理？有几百万消息持续积压几小时，说说怎么解决？
+
+##### 大量消息在 mq 里积压了几个小时了还没解决
+
+几千万条数据在 MQ 里积压了七八个小时，从下午 4 点多，积压到了晚上 11 点多。这个是我们真实遇到过的一个场景，确实是线上故障了，这个时候要不然就是修复 consumer 的问题，让它恢复消费速度，然后傻傻的等待几个小时消费完毕。这个肯定不能在面试的时候说吧。
+
+一个消费者一秒是 1000 条，一秒 3 个消费者是 3000 条，一分钟就是 18 万条。所以如果你积压了几百万到上千万的数据，即使消费者恢复了，也需要大概 1 小时的时间才能恢复过来。
+
+一般这个时候，只能临时紧急扩容了，具体操作步骤和思路如下：
+
+- 先修复 consumer 的问题，确保其恢复消费速度，然后将现有 consumer 都停掉。
+- 新建一个 topic，partition 是原来的 10 倍，临时建立好原先 10 倍的 queue 数量。
+- 然后写一个临时的分发数据的 consumer 程序，这个程序部署上去消费积压的数据，**消费之后不做耗时的处理**，直接均匀轮询写入临时建立好的 10 倍数量的 queue。
+- 接着临时征用 10 倍的机器来部署 consumer，每一批 consumer 消费一个临时 queue 的数据。这种做法相当于是临时将 queue 资源和 consumer 资源扩大 10 倍，以正常的 10 倍速度来消费数据。
+- 等快速消费完积压数据之后，**得恢复原先部署的架构**，**重新**用原先的 consumer 机器来消费消息。
+
+##### mq 中的消息过期失效了
+
+假设你用的是 RabbitMQ，RabbtiMQ 是可以设置过期时间的，也就是 TTL。如果消息在 queue 中积压超过一定的时间就会被 RabbitMQ 给清理掉，这个数据就没了。那这就是第二个坑了。这就不是说数据会大量积压在 mq 里，而是**大量的数据会直接搞丢**。
+
+这个情况下，就不是说要增加 consumer 消费积压的消息，因为实际上没啥积压，而是丢了大量的消息。我们可以采取一个方案，就是**批量重导**，这个我们之前线上也有类似的场景干过。就是大量积压的时候，我们当时就直接丢弃数据了，然后等过了高峰期以后，比如大家一起喝咖啡熬夜到晚上12点以后，用户都睡觉了。这个时候我们就开始写程序，将丢失的那批数据，写个临时程序，一点一点的查出来，然后重新灌入 mq 里面去，把白天丢的数据给他补回来。也只能是这样了。
+
+假设 1 万个订单积压在 mq 里面，没有处理，其中 1000 个订单都丢了，你只能手动写程序把那 1000 个订单给查出来，手动发到 mq 里去再补一次。
+
+##### mq 都快写满了
+
+如果消息积压在 mq 里，你很长时间都没有处理掉，此时导致 mq 都快写满了，咋办？这个还有别的办法吗？没有，谁让你第一个方案执行的太慢了，你临时写程序，接入数据来消费，**消费一个丢弃一个，都不要了**，快速消费掉所有的消息。然后走第二个方案，到了晚上再补数据吧。
+
+#### 如果让你写一个消息队列，该如何进行架构设计？说一下你的思路。
+
+http://youzhixueyuan.com/design-the-message-queue.html
+
+##### [4.1 系统架构图](http://www.xuxueli.com/xxl-mq/#/?id=_41-%e7%b3%bb%e7%bb%9f%e6%9e%b6%e6%9e%84%e5%9b%be)
+
+![输入图片说明](https://raw.githubusercontent.com/xuxueli/xxl-mq/master/doc/images/img_03.png)
+
+###### [角色解释:](http://www.xuxueli.com/xxl-mq/#/?id=%e8%a7%92%e8%89%b2%e8%a7%a3%e9%87%8a)
+
+- Message : 消息实体;
+- Broker : 消息代理中心, 负责连接Producer和Consumer;
+- Topic : 消息主题, 每个消息队列的唯一性标示;
+- Topic segment : 消息分段, 同一个Topic的消息队列,将会根据订阅的Consumer进行分片分组,每个Consumer拥有的消息片即一个segment;
+- Producer : 消息生产者, 绑定一个消息Topic, 并向该Topic消息队列中生产消息;
+- Consumer : 消息消费者, 绑定一个消息Topic, 只能消费该Topic消息队列中的消息;
+- Consumer Group : 消费者分组，隔离消息；同一个Topic下一条消息消费一次；
+
+###### [架构图模块解读:](http://www.xuxueli.com/xxl-mq/#/?id=%e6%9e%b6%e6%9e%84%e5%9b%be%e6%a8%a1%e5%9d%97%e8%a7%a3%e8%af%bb)
+
+- Server
+  - Broker: 消息代理中心, 系统核心组成模块, 负责接受消息生产者Producer推送生产的消息, 同时负责提供RPC服务供消费者Consumer使用来消费消息;
+  - Message Queue: 消息存储模块, 目前底层使用mysql消息表;
+- Registry Center
+  - Broker Registry Center: Broker注册中心子模块, 供Broker注册RPC服务使用;
+  - Consumer Registry Center: Consumer注册中心子模块, 供Consumer注册消费节点使用;
+- Client
+  - Producer: 消息生产者模块, 负责提供API接口供开发者调用,并生成和发送队列消息;
+  - Consumer: 消息消费者模块, 负责订阅消息并消息;
+
+##### [4.2 Message设计](http://www.xuxueli.com/xxl-mq/#/?id=_42-message%e8%ae%be%e8%ae%a1)
+
+| 消息核心属性 | 说明                                                         |
+| ------------ | ------------------------------------------------------------ |
+| topic        | 消息主题                                                     |
+| group        | 消息分组, 分组一致时消息仅消费一次；存在多个分组时，多个分组时【广播消费】； |
+| data         | 消息数据                                                     |
+| retryCount   | 重试次数, 执行失败且大于0时生效，每重试一次减一；            |
+| shardingId   | 分片ID, 大于0时启用，否则使用消息ID；消费者通过该参数进行消息分片消费；分片ID不一致时分片【并发消费】、一致时【串行消费】； |
+| timeout      | 超时时间，单位秒；大于0时生效，处于锁定运行状态且运行超时时，将主动标记运行失败； |
+| effectTime   | 生效时间, new Date()立即执行, 否则在生效时间点之后开始执行;  |
+
+##### [4.3 Broker设计](http://www.xuxueli.com/xxl-mq/#/?id=_43-broker%e8%ae%be%e8%ae%a1)
+
+Broker(消息代理中心)：系统核心组成模块, 负责接受消息生产者Producer推送生产的消息, 同时负责提供RPC服务供消费者Consumer使用来消费消息；
+
+Broker支持集群部署, 集群节点之间地位平等, 集群部署情况下可大大提高系统的消息吞吐量。
+
+Broker通过内置注册中心实现集群功能, 各节点在启动时会自动注册到注册中心, Producer或Consumer在生产消息或者消费消息时,将会通过内置注册中心自动感知到在线的Broker节点。
+
+Broker在接收到Produce的生产消息的RPC调用时, 并不会立即存储该消息, 而是立即push到内存队列中, 同时立即响应RPC调用。 内存队列将会异步将队列中的消息数据存储到Mysql中。
+
+Broker在接收到 "消息锁定" 等同步RPC调用时, 将会触发同步调用, 采用乐观锁方式锁定消息;
+
+##### [4.4 Registry Center设计](http://www.xuxueli.com/xxl-mq/#/?id=_44-registry-center%e8%ae%be%e8%ae%a1)
+
+Registry Center(注册中心)主要分为两个子模块: Broker注册中心、Consumer注册中心;
+
+- Broker注册中心子模块: 供Broker注册RPC服务使用;
+- Consumer注册中心子模块: 供Consumer注册消费节点使用;
+
+##### [4.5 Producer设计](http://www.xuxueli.com/xxl-mq/#/?id=_45-producer%e8%ae%be%e8%ae%a1)
+
+Producer(消息生产者), 兼容“异步批量多线程生产”+“同步生产”两种方式，提升消息发送性能；
+
+底层通讯全异步化：消息新增 + 消息新增接受 + 消息回调 + 消息回调接受；仅批量PULL消息与锁消息非异步；
+
+##### [4.6 Consumer设计](http://www.xuxueli.com/xxl-mq/#/?id=_46-consumer%e8%ae%be%e8%ae%a1)
+
+| MqConsumer注解属性 | 说明                                                         |
+| ------------------ | ------------------------------------------------------------ |
+| group              | 消息分组；为空时自动赋值UUID多分组【广播消费】；             |
+| topic              | 消息主题                                                     |
+| transaction        | 事务开关，开启消息事务性保证只会成功执行一次;关闭时可能重复消费，性能较优； |
+
+消费者通过 "多线程轮训 + 消息分片 + PULL + 消息锁定" 的方式来实现:
+
+- 多线程轮训: 该模式下每个Consumer将会存在一个线程, 如存在多个Consumer, 多个Consumer将会并行消息同一主题下的消息, 大大提高消息的消费速度;
+  - 轮训延时自适应：线程轮训方式PULL消息，如若获取不到消息将会主动休眠，休眠时间依次递增10s，最长60s；即消息生产之后距离被消费存在 0~60s 的时间差，分钟范围内；
+- 消息分片 : 队列中消息将会按照 "Registry Center" 中注册的Consumer列表顺序进行消息分段, 保证一条消息只会被分配给其中一个Consumer, 每个Consumer只会消费分配给自己的消息。 因此在多个Consumer并发消息时, 可以保证同一条消息不被多个Consumer竞争来重复消息。
+  - 分片函数: MOD("消息分片ID", #{在线消费者总数}) = #{当前消费者排名} ,
+  - 分片逻辑解释: 每个Consumer通过注册中心感知到在线所有的Consumer, 计算出在线Consumer总数total, 以及当前Consumer在所有Consumer中的排名rank; 把消息分片ID对在线Consumer总数total进行取模, 余数和当前Consumer排名rank一致的消息认定为分配给自己的消息;
+- PULL : 每个Consumer将会轮训PULL消息分片分配给自己的消息, 顺序消费。
+- 消息锁定: Consumer在消费每一条消息时,开启事务时，将会主动进行消息锁定, 通过数据库乐观锁来实现, 锁定成功后消息状态变更为执行中状态, 将不会被Consumer再次PULL到。因此, 可以更进一步保证每条消息只会被消费一次;
+- 消息状态和日志: 消息执行结束后, 将会调用Broker的RPC服务修改消息状态并追加消息日志, Broker将会通过内存队列方式, 异步消息队列中变更存储到数据库中。
+
+##### [4.7 延时消息](http://www.xuxueli.com/xxl-mq/#/?id=_47-%e5%bb%b6%e6%97%b6%e6%b6%88%e6%81%af)
+
+支持设置消息的延迟生效时间, 到达设置的生效时间时该消息才会被消费；适用于延时消费场景，如订单超时取消等;
+
+##### [4.8 事务性](http://www.xuxueli.com/xxl-mq/#/?id=_48-%e4%ba%8b%e5%8a%a1%e6%80%a7)
+
+消费者开启事务开关后,消息事务性保证只会成功执行一次;
+
+##### [4.9 失败重试](http://www.xuxueli.com/xxl-mq/#/?id=_49-%e5%a4%b1%e8%b4%a5%e9%87%8d%e8%af%95)
+
+支持设置消息的重试次数, 在消息执行失败后将会按照设置的值进行消息重试执行,直至重试次数耗尽或者执行成功;
+
+##### [4.10 超时控制](http://www.xuxueli.com/xxl-mq/#/?id=_410-%e8%b6%85%e6%97%b6%e6%8e%a7%e5%88%b6)
+
+支持自定义消息超时时间，消息消费超时将会主动中断；
+
+##### [4.11 海量数据堆积](http://www.xuxueli.com/xxl-mq/#/?id=_411-%e6%b5%b7%e9%87%8f%e6%95%b0%e6%8d%ae%e5%a0%86%e7%a7%af)
+
+消息中心数据库，原生兼容支持 "MySQL、TIDB" 两种存储方式，前者支持千万级消息堆积，后者支持百亿级别消息堆积（TIDB理论上无上限）；
+
+可视情况选择使用，当选择TIDB时，仅需要修改消息中心数据库连接jdbc地址配置即可，其他部分如SQL和驱动兼容MySQL和TIDB使用，不需修改。
+
+#### 一、 消息队列概述
+
+##### 2.5 消息通讯
+
+https://cloud.tencent.com/developer/article/1006035
+
+消息队列包括两种模式，点对点模式（point to point， queue）和发布/订阅模式（publish/subscribe，topic）。
+
+###### 3.1 点对点模式
+
+点对点模式下包括三个角色：
+
+- 消息队列
+- 发送者 (生产者)
+- 接收者（消费者）
+
+
+
+![img](https://blog-10039692.file.myqcloud.com/1506330130593_2564_1506330132919.png)
+
+消息发送者生产消息发送到queue中，然后消息接收者从queue中取出并且消费消息。消息被消费以后，queue中不再有存储，所以消息接收者不可能消费到已经被消费的消息。
+
+点对点模式特点：
+
+- 每个消息只有一个接收者（Consumer）(即一旦被消费，消息就不再在消息队列中)；
+- 发送者和接收者间没有依赖性，发送者发送消息之后，不管有没有接收者在运行，都不会影响到发送者下次发送消息；
+- 接收者在成功接收消息之后需向队列应答成功，以便消息队列删除当前接收的消息；
+
+###### 3.2 发布/订阅模式
+
+发布/订阅模式下包括三个角色：
+
+- 角色主题（Topic）
+- 发布者(Publisher)
+- 订阅者(Subscriber)
+
+
+
+![img](https://blog-10039692.file.myqcloud.com/1506330158945_9538_1506330161280.png)
+
+发布者将消息发送到Topic,系统将这些消息传递给多个订阅者。
+
+发布/订阅模式特点：
+
+- 每个消息可以有多个订阅者；
+- 发布者和订阅者之间有时间上的依赖性。针对某个主题（Topic）的订阅者，它必须创建一个订阅者之后，才能消费发布者的消息。
+- 为了消费消息，订阅者需要提前订阅该角色主题，并保持在线运行；
+
+### 5、分布式锁
+
+#### redis 分布式锁
+
+官方叫做 `RedLock` 算法，是 redis 官方支持的分布式锁算法。
+
+这个分布式锁有 3 个重要的考量点：
+
+- 互斥（只能有一个客户端获取锁）
+- 不能死锁
+- 容错（只要大部分 redis 节点创建了这把锁就可以）
+
+##### redis 最普通的分布式锁
+
+第一个最普通的实现方式，就是在 redis 里创建一个 key，这样就算加锁。
+
+```
+SET my:lock 随机值 NX PX 30000
+
+```
+
+执行这个命令就 ok。
+
+- `NX`：表示只有 `key` 不存在的时候才会设置成功。（如果此时 redis 中存在这个 key，那么设置失败，返回 `nil`）
+- `PX 30000`：意思是 30s 后锁自动释放。别人创建的时候如果发现已经有了就不能加锁了。
+
+释放锁就是删除 key ，但是一般可以用 `lua` 脚本删除，判断 value 一样才删除：
+
+```java
+-- 删除锁的时候，找到 key 对应的 value，跟自己传过去的 value 做比较，如果是一样的才删除。
+if redis.call("get",KEYS[1]) == ARGV[1] then
+    return redis.call("del",KEYS[1])
+else
+    return 0
+end
+```
+
+为啥要用随机值呢？因为如果某个客户端获取到了锁，但是阻塞了很长时间才执行完，比如说超过了 30s，此时可能已经自动释放锁了，此时可能别的客户端已经获取到了这个锁，要是你这个时候直接删除 key 的话会有问题，所以得用随机值加上面的 `lua` 脚本来释放锁。
+
+但是这样是肯定不行的。因为如果是普通的 redis 单实例，那就是单点故障。或者是 redis 普通主从，那 redis 主从异步复制，如果主节点挂了（key 就没有了），key 还没同步到从节点，此时从节点切换为主节点，别人就可以 set key，从而拿到锁。
+
+##### RedLock 算法
+
+这个场景是假设有一个 redis cluster，有 5 个 redis master 实例。然后执行如下步骤获取一把锁：
+
+1. 获取当前时间戳，单位是毫秒；
+2. 跟上面类似，轮流尝试在每个 master 节点上创建锁，过期时间较短，一般就几十毫秒；
+3. 尝试在**大多数节点**上建立一个锁，比如 5 个节点就要求是 3 个节点 `n / 2 + 1`；
+4. 客户端计算建立好锁的时间，如果建立锁的时间小于超时时间，就算建立成功了；
+5. 要是锁建立失败了，那么就依次之前建立过的锁删除；
+6. 只要别人建立了一把分布式锁，你就得**不断轮询去尝试获取锁**。
+
+[![redis-redlock](https://github.com/Fi-Null/advanced-java/raw/master/images/redis-redlock.png)](https://github.com/Fi-Null/advanced-java/blob/master/images/redis-redlock.png)
+
+#### zk 分布式锁
+
+zk 分布式锁，其实可以做的比较简单，就是某个节点尝试创建临时 znode，此时创建成功了就获取了这个锁；这个时候别的客户端来创建锁会失败，只能**注册个监听器**监听这个锁。释放锁就是删除这个 znode，一旦释放掉就会通知客户端，然后有一个等待着的客户端就可以再次重新加锁。
+
+```java
+/**
+ * ZooKeeperSession
+ * 
+ * @author bingo
+ * @since 2018/11/29
+ *
+ */
+public class ZooKeeperSession {
+
+    private static CountDownLatch connectedSemaphore = new CountDownLatch(1);
+
+    private ZooKeeper zookeeper;
+    private CountDownLatch latch;
+
+    public ZooKeeperSession() {
+        try {
+            this.zookeeper = new ZooKeeper("192.168.31.187:2181,192.168.31.19:2181,192.168.31.227:2181", 50000, new ZooKeeperWatcher());
+            try {
+                connectedSemaphore.await();
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+
+            System.out.println("ZooKeeper session established......");
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    /**
+     * 获取分布式锁
+     * 
+     * @param productId
+     */
+    public Boolean acquireDistributedLock(Long productId) {
+        String path = "/product-lock-" + productId;
+
+        try {
+            zookeeper.create(path, "".getBytes(), Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL);
+            return true;
+        } catch (Exception e) {
+            while (true) {
+                try {
+                    // 相当于是给node注册一个监听器，去看看这个监听器是否存在
+                    Stat stat = zk.exists(path, true);
+
+                    if (stat != null) {
+                        this.latch = new CountDownLatch(1);
+                        this.latch.await(waitTime, TimeUnit.MILLISECONDS);
+                        this.latch = null;
+                    }
+                    zookeeper.create(path, "".getBytes(), Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL);
+                    return true;
+                } catch (Exception ee) {
+                    continue;
+                }
+            }
+
+        }
+        return true;
+    }
+
+    /**
+     * 释放掉一个分布式锁
+     * 
+     * @param productId
+     */
+    public void releaseDistributedLock(Long productId) {
+        String path = "/product-lock-" + productId;
+        try {
+            zookeeper.delete(path, -1);
+            System.out.println("release the lock for product[id=" + productId + "]......");
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    /**
+     * 建立zk session的watcher
+     * 
+     * @author bingo
+     * @since 2018/11/29
+     *
+     */
+    private class ZooKeeperWatcher implements Watcher {
+
+        public void process(WatchedEvent event) {
+            System.out.println("Receive watched event: " + event.getState());
+
+            if (KeeperState.SyncConnected == event.getState()) {
+                connectedSemaphore.countDown();
+            }
+
+            if (this.latch != null) {
+                this.latch.countDown();
+            }
+        }
+
+    }
+
+    /**
+     * 封装单例的静态内部类
+     * 
+     * @author bingo
+     * @since 2018/11/29
+     *
+     */
+    private static class Singleton {
+
+        private static ZooKeeperSession instance;
+
+        static {
+            instance = new ZooKeeperSession();
+        }
+
+        public static ZooKeeperSession getInstance() {
+            return instance;
+        }
+
+    }
+
+    /**
+     * 获取单例
+     * 
+     * @return
+     */
+    public static ZooKeeperSession getInstance() {
+        return Singleton.getInstance();
+    }
+
+    /**
+     * 初始化单例的便捷方法
+     */
+    public static void init() {
+        getInstance();
+    }
+
+}
+```
+
+也可以采用另一种方式，创建临时顺序节点：
+
+如果有一把锁，被多个人给竞争，此时多个人会排队，第一个拿到锁的人会执行，然后释放锁；后面的每个人都会去监听**排在自己前面**的那个人创建的 node 上，一旦某个人释放了锁，排在自己后面的人就会被 zookeeper 给通知，一旦被通知了之后，就 ok 了，自己就获取到了锁，就可以执行代码了。
+
+```java
+public class ZooKeeperDistributedLock implements Watcher {
+
+    private ZooKeeper zk;
+    private String locksRoot = "/locks";
+    private String productId;
+    private String waitNode;
+    private String lockNode;
+    private CountDownLatch latch;
+    private CountDownLatch connectedLatch = new CountDownLatch(1);
+    private int sessionTimeout = 30000;
+
+    public ZooKeeperDistributedLock(String productId) {
+        this.productId = productId;
+        try {
+            String address = "192.168.31.187:2181,192.168.31.19:2181,192.168.31.227:2181";
+            zk = new ZooKeeper(address, sessionTimeout, this);
+            connectedLatch.await();
+        } catch (IOException e) {
+            throw new LockException(e);
+        } catch (KeeperException e) {
+            throw new LockException(e);
+        } catch (InterruptedException e) {
+            throw new LockException(e);
+        }
+    }
+
+    public void process(WatchedEvent event) {
+        if (event.getState() == KeeperState.SyncConnected) {
+            connectedLatch.countDown();
+            return;
+        }
+
+        if (this.latch != null) {
+            this.latch.countDown();
+        }
+    }
+
+    public void acquireDistributedLock() {
+        try {
+            if (this.tryLock()) {
+                return;
+            } else {
+                waitForLock(waitNode, sessionTimeout);
+            }
+        } catch (KeeperException e) {
+            throw new LockException(e);
+        } catch (InterruptedException e) {
+            throw new LockException(e);
+        }
+    }
+
+    public boolean tryLock() {
+        try {
+ 		    // 传入进去的locksRoot + “/” + productId
+		    // 假设productId代表了一个商品id，比如说1
+		    // locksRoot = locks
+		    // /locks/10000000000，/locks/10000000001，/locks/10000000002
+            lockNode = zk.create(locksRoot + "/" + productId, new byte[0], ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL_SEQUENTIAL);
+   
+            // 看看刚创建的节点是不是最小的节点
+	 	    // locks：10000000000，10000000001，10000000002
+            List<String> locks = zk.getChildren(locksRoot, false);
+            Collections.sort(locks);
+	
+            if(lockNode.equals(locksRoot+"/"+ locks.get(0))){
+                //如果是最小的节点,则表示取得锁
+                return true;
+            }
+	
+            //如果不是最小的节点，找到比自己小1的节点
+	  int previousLockIndex = -1;
+            for(int i = 0; i < locks.size(); i++) {
+		if(lockNode.equals(locksRoot + “/” + locks.get(i))) {
+	         	    previousLockIndex = i - 1;
+		    break;
+		}
+	   }
+	   
+	   this.waitNode = locks.get(previousLockIndex);
+        } catch (KeeperException e) {
+            throw new LockException(e);
+        } catch (InterruptedException e) {
+            throw new LockException(e);
+        }
+        return false;
+    }
+
+    private boolean waitForLock(String waitNode, long waitTime) throws InterruptedException, KeeperException {
+        Stat stat = zk.exists(locksRoot + "/" + waitNode, true);
+        if (stat != null) {
+            this.latch = new CountDownLatch(1);
+            this.latch.await(waitTime, TimeUnit.MILLISECONDS);
+            this.latch = null;
+        }
+        return true;
+    }
+
+    public void unlock() {
+        try {
+            // 删除/locks/10000000000节点
+            // 删除/locks/10000000001节点
+            System.out.println("unlock " + lockNode);
+            zk.delete(lockNode, -1);
+            lockNode = null;
+            zk.close();
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        } catch (KeeperException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public class LockException extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+
+        public LockException(String e) {
+            super(e);
+        }
+
+        public LockException(Exception e) {
+            super(e);
+        }
+    }
+}
+```
+
+#### redis 分布式锁和 zk 分布式锁的对比
+
+- redis 分布式锁，其实**需要自己不断去尝试获取锁**，比较消耗性能。
+- zk 分布式锁，获取不到锁，注册个监听器即可，不需要不断主动尝试获取锁，性能开销较小。
+
+另外一点就是，如果是 redis 获取锁的那个客户端 出现 bug 挂了，那么只能等待超时时间之后才能释放锁；而 zk 的话，因为创建的是临时 znode，只要客户端挂了，znode 就没了，此时就自动释放锁。
+
+redis 分布式锁大家没发现好麻烦吗？遍历上锁，计算时间等等......zk 的分布式锁语义清晰实现简单。
+
+所以先不分析太多的东西，就说这两点，我个人实践认为 zk 的分布式锁比 redis 的分布式锁牢靠、而且模型简单易用。
+
+## 五、项目经验
+
+### 1、订单中心
+
+### 2、 商家中心
+
+### 3、合流墙系统
+
+### 4、长链接服务
+
+#### 一、Http
+
+##### HTTP协议与TCP/IP协议的关系
+
+​	HTTP的长连接和短连接本质上是TCP长连接和短连接。HTTP属于应用层协议，在传输层使用TCP协议，在网络层使用IP协议。 IP协议主要解决网络路由和寻址问题，TCP协议主要解决如何在IP层之上可靠地传递数据包，使得网络上接收端收到发送端所发出的所有包，并且顺序与发送顺序一致。TCP协议是可靠的、面向连接的。
+
+##### 如何理解HTTP协议是无状态的
+
+​	HTTP协议是无状态的，指的是协议对于事务处理没有记忆能力，服务器不知道客户端是什么状态。也就是说，打开一个服务器上的网页和上一次打开这个服务器上的网页之间没有任何联系。HTTP是一个无状态的面向连接的协议，无状态不代表HTTP不能保持TCP连接，更不能代表HTTP使用的是UDP协议（无连接）。
+
+##### 什么是长连接、短连接？
+
+​	在HTTP/1.0中默认使用短连接。也就是说，客户端和服务器每进行一次HTTP操作，就建立一次连接，任务结束就中断连接。当客户端浏览器访问的某个HTML或其他类型的Web页中包含有其他的Web资源（如JavaScript文件、图像文件、CSS文件等），每遇到这样一个Web资源，浏览器就会重新建立一个HTTP会话。
+
+​	而从HTTP/1.1起，默认使用长连接，用以保持连接特性。使用长连接的HTTP协议，会在响应头加入这行代码：
+
+```
+Connection:keep-alive
+
+```
+
+​	在使用长连接的情况下，当一个网页打开完成后，客户端和服务器之间用于传输HTTP数据的TCP连接不会关闭，客户端再次访问这个服务器时，会继续使用这一条已经建立的连接。Keep-Alive不会永久保持连接，它有一个保持时间，可以在不同的服务器软件（如Apache）中设定这个时间。实现长连接需要客户端和服务端都支持长连接。
+
+​	HTTP协议的长连接和短连接，实质上是TCP协议的长连接和短连接。
+
+##### TCP连接
+
+​	当网络通信时采用TCP协议时，在真正的读写操作之前，客户端与服务器端之间必须建立一个连接，当读写操作完成后，双方不再需要这个连接时可以释放这个连接。连接的建立依靠“三次握手”，而释放则需要“四次握手”，所以每个连接的建立都是需要资源消耗和时间消耗的。
+
+​	经典的三次握手建立连接示意图：
+
+<div align="center"> <img src="pics/sharesocket.jpg" width="400px"> </div><br>
+
+​	经典的四次握手关闭连接示意图：
+
+<div align="center"> <img src="pics/releaseshake.jpg" width="400px"> </div><br>
+
+##### TCP短连接
+
+模拟一下TCP短连接的情况：client向server发起连接请求，server接到请求，然后双方建立连接。client向server发送消息，server回应client，然后一次请求就完成了。这时候双方任意都可以发起close操作，不过一般都是client先发起close操作。上述可知，短连接一般只会在 client/server间传递一次请求操作。
+
+短连接的优点是：管理起来比较简单，存在的连接都是有用的连接，不需要额外的控制手段。
+
+##### TCP长连接
+
+我们再模拟一下长连接的情况：client向server发起连接，server接受client连接，双方建立连接，client与server完成一次请求后，它们之间的连接并不会主动关闭，后续的读写操作会继续使用这个连接。
+
+TCP的保活功能主要为服务器应用提供。如果客户端已经消失而连接未断开，则会使得服务器上保留一个半开放的连接，而服务器又在等待来自客户端的数据，此时服务器将永远等待客户端的数据。保活功能就是试图在服务端器端检测到这种半开放的连接。
+
+如果一个给定的连接在两小时内没有任何动作，服务器就向客户发送一个探测报文段，根据客户端主机响应探测4个客户端状态：
+
+- 客户主机依然正常运行，且服务器可达。此时客户的TCP响应正常，服务器将保活定时器复位。
+- 客户主机已经崩溃，并且关闭或者正在重新启动。上述情况下客户端都不能响应TCP。服务端将无法收到客户端对探测的响应。服务器总共发送10个这样的探测，每个间隔75秒。若服务器没有收到任何一个响应，它就认为客户端已经关闭并终止连接。
+- 客户端崩溃并已经重新启动。服务器将收到一个对其保活探测的响应，这个响应是一个复位，使得服务器终止这个连接。
+- 客户机正常运行，但是服务器不可达。这种情况与第二种状态类似。
+
+##### 长连接和短连接的优点和缺点
+
+由上可以看出，长连接可以省去较多的TCP建立和关闭的操作，减少浪费，节约时间。对于频繁请求资源的客户端适合使用长连接。在长连接的应用场景下，client端一般不会主动关闭连接，当client与server之间的连接一直不关闭，随着客户端连接越来越多，server会保持过多连接。这时候server端需要采取一些策略，如关闭一些长时间没有请求发生的连接，这样可以避免一些恶意连接导致server端服务受损；如果条件允许则可以限制每个客户端的最大长连接数，这样可以完全避免恶意的客户端拖垮整体后端服务。
+
+短连接对于服务器来说管理较为简单，存在的连接都是有用的连接，不需要额外的控制手段。但如果客户请求频繁，将在TCP的建立和关闭操作上浪费较多时间和带宽。
+
+长连接和短连接的产生在于client和server采取的关闭策略。不同的应用场景适合采用不同的策略。
+
+#### 二、Websocket
+
+[WebSocket](https://link.jianshu.com/?t=http://websocket.org/) 是一种网络通信协议。[RFC6455](https://link.jianshu.com/?t=https://tools.ietf.org/html/rfc6455) 定义了它的通信标准。
+
+WebSocket 是 HTML5 开始提供的一种在单个 TCP 连接上进行全双工通讯的协议。
+
+##### 为什么需要 WebSocket ？
+
+​	了解计算机网络协议的人，应该都知道：HTTP 协议是一种无状态的、无连接的、单向的应用层协议。它采用了请求/响应模型。通信请求只能由客户端发起，服务端对请求做出应答处理。
+
+​	这种通信模型有一个弊端：HTTP 协议无法实现服务器主动向客户端发起消息。
+
+​	这种单向请求的特点，注定了如果服务器有连续的状态变化，客户端要获知就非常麻烦。大多数 Web 应用程序将通过频繁的异步JavaScript和XML（AJAX）请求实现长轮询。轮询的效率低，非常浪费资源（因为必须不停连接，或者 HTTP 连接始终打开）。
+
+<div align="center"> <img src="pics/longPoll.png" width="700px"> </div><br>
+
+​	轮循，也叫短轮循，英文名也叫Polling。它很简单，只是用ajax隔一段时间，可能是1秒，2秒，时间自己设定，向服务器发送请求。这种方案会频繁地与服务器通讯，每次通讯都是发送完整的http请求，如果服务器经常有数据变动，有回应还好，有时候发送的请求都是没有意义，都是在等服务器端的回应，而服务器又没有任何改变，所以这种方式很消耗网络资源，很低效。
+
+​	长轮循是对定时轮询的改进和提高，目地是为了降低无效的网络传输。这种方式也是通过ajax请求发送数据到服务器端，服务器端一直hold住这个连接，直到有数据到达，通过这种机制来减少无效的客户端和服务器间的交互，比如可以通过这种方式实现简易型的聊天室，但是，如果服务端的数据变更非常频繁的话，或者说访问的人非常多的时候，这种机制和定时轮询比较起来没有本质上的性能的提高。
+
+​	因此，工程师们一直在思考，有没有更好的方法。WebSocket 就是这样发明的。WebSocket 连接允许客户端和服务器之间进行全双工通信，以便任一方都可以通过建立的连接将数据推送到另一端。WebSocket 只需要建立一次连接，就可以一直保持连接状态。这相比于轮询方式的不停建立连接显然效率要大大提高。
+
+##### WebSocket 如何工作？
+
+​	WebSocket是HTML5下一种新的协议。它实现了浏览器与服务器全双工通信，能更好的节省服务器资源和带宽并达到实时通讯的目的。它与HTTP一样通过已建立的TCP连接来传输数据，但是它和HTTP最大不同是：
+
+- WebSocket是一种双向通信协议。在建立连接后，WebSocket服务器端和客户端都能主动发送数据给对方或向对方接收数据，就像Socket一样；
+- WebSocket需要像TCP一样，先建立连接，连接成功后才能相互通信。
+
+<div align="center"> <img src="pics/http.jpg" width="500px"> </div><br>
+
+<div align="center"> <img src="pics/websocket.jpg" width="500px"> </div><br>
+
+相比HTTP长连接，WebSocket有以下特点：
+
+- 是真正的全双工方式，建立连接后客户端与服务器端是完全平等的，可以互相主动请求。而HTTP长连接基于HTTP，是传统的客户端对服务器发起请求的模式。
+- HTTP长连接中，每次数据交换除了真正的数据部分外，服务器和客户端还要大量交换HTTP header，信息交换效率很低。Websocket协议通过第一个request建立了TCP连接之后，之后交换的数据都不需要发送 HTTP header就能交换数据，这显然和原有的HTTP协议有区别所以它需要对服务器和客户端都进行升级才能实现（主流浏览器都已支持HTML5）。此外还有 multiplexing、不同的URL可以复用同一个WebSocket连接等功能。这些都是HTTP长连接不能做到的。
+
+##### WebSocket 属性
+
+以下是 WebSocket 对象的属性。假定我们使用了以上代码创建了 Socket 对象：
+
+| 属性                  | 描述                                                         |
+| --------------------- | ------------------------------------------------------------ |
+| Socket.readyState     | 只读属性 **readyState** 表示连接状态，可以是以下值：0 - 表示连接尚未建立。1 - 表示连接已建立，可以进行通信。2 - 表示连接正在进行关闭。3 - 表示连接已经关闭或者连接不能打开。 |
+| Socket.bufferedAmount | 只读属性 **bufferedAmount** 已被 send() 放入正在队列中等待传输，但是还没有发出的 UTF-8 文本字节数。 |
+
+##### WebSocket 事件
+
+以下是 WebSocket 对象的相关事件。假定我们使用了以上代码创建了 Socket 对象：
+
+| 事件    | 事件处理程序     | 描述                       |
+| ------- | ---------------- | -------------------------- |
+| open    | Socket.onopen    | 连接建立时触发             |
+| message | Socket.onmessage | 客户端接收服务端数据时触发 |
+| error   | Socket.onerror   | 通信发生错误时触发         |
+| close   | Socket.onclose   | 连接关闭时触发             |
+
+##### WebSocket 方法
+
+以下是 WebSocket 对象的相关方法。假定我们使用了以上代码创建了 Socket 对象：
+
+| 方法           | 描述             |
+| -------------- | ---------------- |
+| Socket.send()  | 使用连接发送数据 |
+| Socket.close() | 关闭连接         |
+
+**示例**
+
+```javascript
+// 初始化一个 WebSocket 对象
+var ws = new WebSocket("ws://localhost:9998/echo");
+
+// 建立 web socket 连接成功触发事件
+ws.onopen = function () {
+  // 使用 send() 方法发送数据
+  ws.send("发送数据");
+  alert("数据发送中...");
+};
+
+// 接收服务端数据时触发事件
+ws.onmessage = function (evt) {
+  var received_msg = evt.data;
+  alert("数据已接收...");
+};
+
+// 断开 web socket 连接成功触发事件
+ws.onclose = function () {
+  alert("连接已关闭...");
+};
+```
+
+#### 三、C100k问题
+
+https://www.cnblogs.com/davidwang456/p/5086962.html
+
+https://colobu.com/2015/05/22/implement-C1000K-servers-by-spray-netty-undertow-and-node-js/
+
+早期的系统，系统资源包括CPU、内存等都是非常有限的，系统为了保持公平，默认要限制进程对资源的使用情况。由于Linux的默认内核配置无法满足C100K的要求，因此需要对其进行适当的调优。
+
+我们可以通过 `ulimit` 查看一下典型的机器默认的限制情况：
+
+```
+$ ulimit -a
+core file size          (blocks, -c) 0
+data seg size           (kbytes, -d) unlimited
+scheduling priority             (-e) 0
+file size               (blocks, -f) unlimited
+pending signals                 (-i) 204800
+max locked memory       (kbytes, -l) 32
+max memory size         (kbytes, -m) unlimited
+open files                      (-n) 1024
+pipe size            (512 bytes, -p) 8
+POSIX message queues     (bytes, -q) 819200
+real-time priority              (-r) 0
+stack size              (kbytes, -s) 10240
+cpu time               (seconds, -t) unlimited
+max user processes              (-u) 204800
+virtual memory          (kbytes, -v) unlimited
+file locks                      (-x) unlimited
+
+```
+
+比如其中的 `open files`，默认一个进程能打开的文件句柄数量为1024，对于一些需要大量文件句柄的程序，如web服务器、数据库程序等，1024往往是不够用的，在句柄使用完毕的时候，系统就会频繁出现emfile错误。
+
+俗话说：一个巴掌拍不响，要完成 `C100K` 的目标，需要服务器端与客户端的紧密配合，下面将分别对这二者的调优进行介绍。
+
+##### 客户端
+
+###### 1：文件句柄数量受限
+
+在Linux平台上，无论是编写客户端程序还是服务端程序，在进行高并发TCP连接处理时，由于每个TCP连接都要创建一个socket句柄，而每个socket句柄同时也是一个文件句柄，所以其最高并发数量要受到系统对用户单一进程同时可打开文件数量的限制以及整个系统可同时打开的文件数量限制。
+
+###### 1.1：单一进程的文件句柄数量受限
+
+###### 我们可以ulimit命令查看当前用户进程可打开的文件句柄数限制：
+
+```
+[root@localhost ~]# ulimit -n
+1024
+
+```
+
+这表示当前用户的每个进程最多允许同时打开1024个文件，除去每个进程必然打开的标准输入、标准输出、标准错误、服务器监听socket、进程间通讯的unix域socket等文件，剩下的可用于客户端socket连接的文件数就只有大概1024-10=1014个左右。也就是说，在默认情况下，基于Linux的通讯程序最多允许同时1014个TCP并发连接。
+
+对于想支持更高数量的TCP并发连接的通讯处理程序，就必须修改Linux对当前用户的进程可同时打开的文件数量的软限制（soft limit）和硬限制（hardlimit）。其中：
+
+- 软限制是指Linux在当前系统能够承受的范围内进一步限制用户能同时打开的文件数。
+- 硬限制是指根据系统硬件资源状况（主要是系统内存）计算出来的系统最多可同时打开的文件数量。
+
+通常软限制小于或等于硬限制，可通过ulimit命令查看软限制和硬限制：
+
+```
+[root@localhost ~]# ulimit -Sn
+1024
+
+[root@localhost ~]# ulimit -Hn
+4096
+
+```
+
+修改单一进程能同时打开的文件句柄数有2种方法：
+
+1、直接使用ulimit命令，如：
+
+```
+[root@localhost ~]# ulimit -n 1048576
+
+```
+
+执行成功之后，ulimit n、Sn、Hn的值均会变为1048576。但该方法设置的值只会在当前终端有效，且设置的值不能高于方法2中设置的值。
+
+2、对 `/etc/security/limits.conf` 文件，添加或修改：
+
+```
+* soft nofile 1048576
+* hard nofile 1048576
+
+```
+
+其中，
+
+- `*` 代表对所有用户有效，若仅想针对某个用户，可替换星号。
+- soft即软限制，它只是一个警告值。
+- hard代表硬限制，是一个真正意义的阈值，超过就会报错。
+- nofile表示打开文件的最大数量。
+- 1048576 = 1024 * 1024，为什么要取这个值呢？因为
+
+> 在linux kernel 2.6.25之前通过ulimit -n(setrlimit(RLIMIT_NOFILE))设置每个进程的最大打开文件句柄数不能超过NR_OPEN（1024*1024）,也就是100多w（除非重新编译内核），而在25之后，内核导出了一个sys接口可以修改这个最大值（/proc/sys/fs /nr_open）.具体的changelog在<https://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/commit/?id=9cfe015aa424b3c003baba3841a60dd9b5ad319b>
+
+注意文件保存之后，需要注销或重启系统方能生效。
+
+###### 1.2：整个系统的文件句柄数量受限
+
+解决完单一进程的文件句柄数量受限问题后，还要解决整个系统的文件句柄数量受限问题。我们可通过以下命令查看Linux系统级的最大打开文件数限制：
+
+```
+[root@localhost ~]# cat /proc/sys/fs/file-max
+98957
+
+```
+
+file-max表示系统所有进程最多允许同时打开的文件句柄数，是Linux系统级硬限制。通常，这个系统硬限制是Linux系统在启动时根据系统硬件资源状况计算出来的最佳的最大同时打开文件数限制，如果没有特殊需要，不应该修改此限制。
+
+要修改它，需要对 `/etc/sysctl.conf` 文件，增加一行内容：
+
+```
+fs.file-max = 1048576
+
+```
+
+保存成功后，需执行下面命令使之生效：
+
+```
+[root@localhost ~]# sysctl -p
+
+```
+
+###### 2：端口数量受限
+
+解决完文件句柄数量受限的问题后，就要解决IP端口数量受限的问题了。一般来说，对外提供请求的服务端不用考虑端口数量问题，只要监听某一个端口即可。可客户端要模拟大量的用户对服务端发起TCP请求，而每一个请求都需要一个端口，为了使一个客户端尽可能地模拟更多的用户，也就要使客户端拥有更多可使用的端口。
+
+由于端口为16进制，即最大端口数为2的16次方65536（0-65535）。在Linux系统里，1024以下端口只有超级管理员用户（如root）才可以使用，普通用户只能使用大于等于1024的端口值。
+
+我们可以通过以下命令查看系统提供的默认的端口范围：
+
+```
+[root@localhost ~]# cat /proc/sys/net/ipv4/ip_local_port_range
+32768 61000
+
+```
+
+即只有61000-32768=28232个端口可以使用，即单个IP对外只能同时发送28232个TCP请求。
+
+修改方法有以下2种：
+
+1、执行以下命令：
+
+```
+echo "1024 65535"> /proc/sys/net/ipv4/ip_local_port_range
+
+```
+
+该方法立即生效，但重启后会失效。
+
+2、修改 `/etc/sysctl.conf` 文件，增加一行内容：
+
+```
+net.ipv4.ip_local_port_range = 1024 65535
+
+```
+
+保存成功后，需执行下面命令使之生效：
+
+```
+[root@localhost ~]# sysctl -p
+
+```
+
+修改成功后，可用端口即增加到65535-1024=64511个，即单个客户端机器只能同时模拟64511个用户。要想突破这个限制，只能给该客户端增加IP地址，这样即可相应成倍地增加可用IP:PORT数。具体可参考[yongboy的这篇文章](http://www.blogjava.net/yongboy/archive/2013/04/09/397594.html)。
+
+##### 服务端
+
+###### 1：文件描述符数量受限
+
+同客户端的问题1。
+
+###### 2：TCP参数调优
+
+要想提高服务端的性能，以达到我们高并发的目的，需要对系统的TCP参数进行适当的修改优化。
+
+方法同样是修改 `/etc/sysctl.conf` 文件，增加以下内容：
+
+```
+net.ipv4.tcp_tw_reuse = 1 
+
+```
+
+当服务器需要在大量TCP连接之间切换时，会产生大量处于TIME_WAIT状态的连接。TIME_WAIT意味着连接本身是关闭的，但资源还没有释放。将net_ipv4_tcp_tw_reuse设置为1是让内核在安全时尽量回收连接，这比重新建立新连接要便宜得多。
+
+```
+net.ipv4.tcp_fin_timeout = 15
+
+```
+
+这是处于TIME_WAIT状态的连接在回收前必须等待的最小时间。改小它可以加快回收。
+
+```
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+
+```
+
+提高TCP的最大缓冲区大小，其中：
+
+`net.core.rmem_max`：表示接收套接字缓冲区大小的最大值（以字节为单位）。
+
+`net.core.wmem_max`：表示发送套接字缓冲区大小的最大值（以字节为单位）。
+
+```
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+
+```
+
+提高Linux内核自动对socket缓冲区进行优化的能力，其中：
+
+`net.ipv4.tcp_rmem`：用来配置读缓冲的大小，第1个值为最小值，第2个值为默认值，第3个值为最大值。
+
+`net.ipv4.tcp_wmem`：用来配置写缓冲的大小，第1个值为最小值，第2个值为默认值，第3个值为最大值。
+
+```
+net.core.netdev_max_backlog = 4096
+
+```
+
+每个网络接口接收数据包的速率比内核处理这些包的速率快时，允许送到队列的数据包的最大数目。默认为1000。
+
+```
+net.core.somaxconn = 4096
+
+```
+
+表示socket监听（listen）的backlog上限。什么是backlog呢？backlog就是socket的监听队列，当一个请求（request）尚未被处理或建立时，他会进入backlog。而socket server可以一次性处理backlog中的所有请求，处理后的请求不再位于监听队列中。当server处理请求较慢，以至于监听队列被填满后，新来的请求会被拒绝。默认为128。
+
+```
+net.ipv4.tcp_max_syn_backlog = 20480
+
+```
+
+表示SYN队列的长度，默认为1024，加大队列长度为8192，可以容纳更多等待连接的网络连接数。
+
+```
+net.ipv4.tcp_syncookies = 1
+
+```
+
+表示开启SYN Cookies。当出现SYN等待队列溢出时，启用cookies来处理，可防范少量SYN攻击，默认为0，表示关闭。
+
+```
+net.ipv4.tcp_max_tw_buckets = 360000
+
+```
+
+表示系统同时保持TIME_WAIT套接字的最大数量，如果超过这个数字，TIME_WAIT套接字将立刻被清除并打印警告信息。默认为180000。
+
+```
+net.ipv4.tcp_no_metrics_save = 1
+
+```
+
+一个tcp连接关闭后，把这个连接曾经有的参数比如慢启动门限snd_sthresh、拥塞窗口snd_cwnd，还有srtt等信息保存到dst_entry中，只要dst_entry没有失效，下次新建立相同连接的时候就可以使用保存的参数来初始化这个连接。
+
+```
+net.ipv4.tcp_syn_retries = 2
+
+```
+
+表示在内核放弃建立连接之前发送SYN包的数量，默认为4。
+
+```
+net.ipv4.tcp_synack_retries = 2
+
+```
+
+表示在内核放弃连接之前发送SYN+ACK包的数量，默认为5。
+
+完整的TCP参数调优配置如下所示：
+
+```
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+net.core.netdev_max_backlog = 4096
+net.core.somaxconn = 4096
+net.ipv4.tcp_max_syn_backlog = 20480
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_max_tw_buckets = 360000
+net.ipv4.tcp_no_metrics_save = 1
+net.ipv4.tcp_syn_retries = 2
+net.ipv4.tcp_synack_retries = 2
+
+```
+
+###### 其它一些参数
+
+```
+vm.min_free_kbytes = 65536
+
+```
+
+用来确定系统开始回收内存的阀值，控制系统的空闲内存。值越高，内核越早开始回收内存，空闲内存越高。
+
+```
+vm.swappiness = 0
+
+```
+
+控制内核从物理内存移出进程，移到交换空间。该参数从0到100，当该参数=0，表示只要有可能就尽力避免交换进程移出物理内存;该参数=100，这告诉内核疯狂的将数据移出物理内存移到swap缓存中。
+
+### 5、盘古系统
+
+[Linux常用命令](https://github.com/jxnu-liguobin/Java-Learning-Summary/blob/master/src/cn/edu/jxnu/questions/Linux.md)
+
+## 六、 架构
+
+[限流算法](https://www.iminho.me/wiki/blog-4.html)
+
+1. ### 大型网站架构演化
+
+<div align="center"> <img src="pics/revolution.png"> </div><br>
+
+1. #### 大型架构模式
+
+<div align="center"> <img src="pics/architecture1.png" > </div><br>
+
+1. #### 大型网站核心架构要素
+
+<div align="center"> <img src="pics/architecture2.png" > </div><br>
+
+1. #### 瞬时响应:网站的高性能架构
+
+<div align="center"> <img src="pics/architecture3.png" > </div><br>
+
+1. #### 万无一失:网站的高可用架构
+
+<div align="center"> <img src="pics/architecture4.png" > </div><br>
+
+1. #### 永无止境:网站的伸缩性架构
+
+<div align="center"> <img src="pics/architecture5.png" > </div><br>
+
+1. #### 随机应变:网站的可扩展性架构
+
+<div align="center"> <img src="pics/architecture6.png" > </div><br>
+
+1. #### 固若金汤:网站的安全机构
+
+<div align="center"> <img src="pics/architecture7.png" > </div><br>
