@@ -13615,30 +13615,30 @@ vm.swappiness = 0
 
 <div align="center"> <img src="pics/revolution.png"> </div><br>
 
-1. #### 大型架构模式
+#### 2.大型架构模式
 
 <div align="center"> <img src="pics/architecture1.png" > </div><br>
 
-1. #### 大型网站核心架构要素
+#### 3.大型网站核心架构要素
 
 <div align="center"> <img src="pics/architecture2.png" > </div><br>
 
-1. #### 瞬时响应:网站的高性能架构
+#### 4.瞬时响应:网站的高性能架构
 
 <div align="center"> <img src="pics/architecture3.png" > </div><br>
 
-1. #### 万无一失:网站的高可用架构
+#### 5.万无一失:网站的高可用架构
 
 <div align="center"> <img src="pics/architecture4.png" > </div><br>
 
-1. #### 永无止境:网站的伸缩性架构
+#### 6.永无止境:网站的伸缩性架构
 
 <div align="center"> <img src="pics/architecture5.png" > </div><br>
 
-1. #### 随机应变:网站的可扩展性架构
+#### 7.随机应变:网站的可扩展性架构
 
 <div align="center"> <img src="pics/architecture6.png" > </div><br>
 
-1. #### 固若金汤:网站的安全机构
+#### 8.固若金汤:网站的安全机构
 
 <div align="center"> <img src="pics/architecture7.png" > </div><br>
