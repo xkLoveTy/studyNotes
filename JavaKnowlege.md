@@ -5752,13 +5752,13 @@ G1 把堆划分成多个大小相等的独立区域（Region），新生代和�
 
 -XX:MaxGCPauseMillis=100(谨慎使用)：设置每次年轻代垃圾回收的最长时间（单位毫秒）
 
--XX:+UseAdaptiveSizePolicy(**默认开启，surviveRatio参数实效**)：自适应策略
+-XX:+UseAdaptiveSizePolicy(**默认开启，surviveRatio参数实效**)：自适应策略
 
 **并发收集器（响应时间优先）**
 
 -XX:+UseConcMarkSweepGC：即CMS收集，设置年老代为并发收集。
 
--XX:+UseParNewGC：设置年轻代为并发收集。
+-XX:+UseParNewGC：设置年轻代为并发收集。
 
 -XX:ParallelCMSThreads:CMS默认启动的回收线程数目是 (ParallelGCThreads + 3)/4)
 
@@ -5766,7 +5766,7 @@ G1 把堆划分成多个大小相等的独立区域（Region），新生代和�
 
 XX:+UseCMSCompactAtFullCollection：设置CMS收集器在完成垃圾回收了之后是否进行一次内存碎片整理(整理过程是独占的，会引起停顿时间变长)
 
--XX:+UseCMSInitiatingOccupancyOnly：使用手动定义初始化定义开始CMS收集
+-XX:+UseCMSInitiatingOccupancyOnly：使用手动定义初始化定义开始CMS收集
 
 -XX:CMSInitiatingOccupancyFraction=70：表示年老代内存空间使用到70%时就开始执行CMS收集
 
@@ -13611,7 +13611,7 @@ vm.swappiness = 0
 
 [限流算法](https://www.iminho.me/wiki/blog-4.html)
 
-1. ### 大型网站架构演化
+#### 1.大型网站架构演化
 
 <div align="center"> <img src="pics/revolution.png"> </div><br>
 
@@ -13642,3 +13642,13 @@ vm.swappiness = 0
 #### 8.固若金汤:网站的安全机构
 
 <div align="center"> <img src="pics/architecture7.png" > </div><br>
+
+动态规划:
+
+https://juejin.im/post/5a29d52cf265da43333e4da7
+
+https://www.zhihu.com/question/23995189
+
+https://www.liuchuo.net/archives/2325
+
+https://www.liuchuo.net/archives/tag/leetcode-oj/page/2
