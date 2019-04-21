@@ -8,15 +8,20 @@
         <outputRelativeToContentRoot value="true" />
         <module name="basic" />
         <module name="disruptor" />
+        <module name="java-algorithm" />
         <module name="java-basic" />
         <module name="java-disruptor" />
         <module name="java-netty" />
+        <module name="java-spring-jdbc-sharding" />
       </profile>
     </annotationProcessing>
     <bytecodeTargetLevel target="1.8">
-      <module name="java-basic" target="1.5" />
+      <module name="java-algorithm" target="1.8" />
+      <module name="java-all" target="1.5" />
+      <module name="java-basic" target="1.8" />
       <module name="java-disruptor" target="1.5" />
       <module name="java-netty" target="1.5" />
+      <module name="java-spring-jdbc-sharding" target="1.8" />
       <module name="studyNotes" target="1.5" />
     </bytecodeTargetLevel>
   </component>

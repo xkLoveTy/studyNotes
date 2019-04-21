@@ -13,6 +13,7 @@
         <module>java-disruptor</module>
         <module>java-netty</module>
         <module>java-spring-jdbc-sharding</module>
+        <module>java-algorithm</module>
     </modules>
 
     <properties>

@@ -2,9 +2,13 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
+      <module fileurl="file://$PROJECT_DIR$/java-algorithm/java-algorithm.iml" filepath="$PROJECT_DIR$/java-algorithm/java-algorithm.iml" />
+      <module fileurl="file://$PROJECT_DIR$/java-algorithm.iml" filepath="$PROJECT_DIR$/java-algorithm.iml" />
+      <module fileurl="file://$PROJECT_DIR$/java-all.iml" filepath="$PROJECT_DIR$/java-all.iml" />
       <module fileurl="file://$PROJECT_DIR$/java-basic/java-basic.iml" filepath="$PROJECT_DIR$/java-basic/java-basic.iml" />
       <module fileurl="file://$PROJECT_DIR$/java-disruptor/java-disruptor.iml" filepath="$PROJECT_DIR$/java-disruptor/java-disruptor.iml" />
       <module fileurl="file://$PROJECT_DIR$/java-netty/java-netty.iml" filepath="$PROJECT_DIR$/java-netty/java-netty.iml" />
+      <module fileurl="file://$PROJECT_DIR$/java-spring-jdbc-sharding/java-spring-jdbc-sharding.iml" filepath="$PROJECT_DIR$/java-spring-jdbc-sharding/java-spring-jdbc-sharding.iml" />
       <module fileurl="file://$PROJECT_DIR$/studyNotes.iml" filepath="$PROJECT_DIR$/studyNotes.iml" />
     </modules>
   </component>
