@@ -5713,6 +5713,13 @@ https://juejin.im/entry/5af0832c51882567244deb44
 
 https://blog.csdn.net/lijingyao8206/article/details/80513383
 
+https://www.jianshu.com/p/ac1ba3479c08
+
+ G1 GC是设计用来取代CMS的，同CMS相比G1有以下优势：
+1、可预测的停顿模型
+2、避免了CMS的垃圾碎片
+3、超大堆的表现更出色
+
 G1（Garbage-First），它是一款面向服务端应用的垃圾收集器，在多 CPU 和大内存的场景下有很好的性能。HotSpot 开发团队赋予它的使命是未来可以替换掉 CMS 收集器。
 
 堆被分为新生代和老年代，其它收集器进行收集的范围都是整个新生代或者老年代，而 G1 可以直接对新生代和老年代一起回收。
@@ -5745,15 +5752,18 @@ Young GC主要是对Eden区进行GC，它在Eden空间耗尽时会被触发。�
 
 G1控制YGC开销的手段是动态改变young region的个数，YGC的过程中依然会STW(stop the world 应用停顿)，并采用多线程并发复制对象，减少GC停顿时间。
 
-YGC开始
+YoungGC的回收过程如下：
 
-我们从图中看到Eden区中存活对象被复制到新的Survior区。
-
+    根扫描,跟CMS类似，Stop the world，扫描GC Roots对象。
+    处理Dirty card,更新RSet.
+    扫描RSet,扫描RSet中所有old区对扫描到的young区或者survivor去的引用。
+    拷贝扫描出的存活的对象到survivor2/old区
+    处理引用队列，软引用，弱引用，虚引用
 **YGC是否需要扫描整个老年代？**
 
 CMS中使用了Card Table的结构，里面记录了老年代对象到新生代引用。**Card Table的结构是一个连续的byte[]数组，扫描Card Table的时间比扫描整个老年代的代价要小很多！G1也参照了这个思路，不过采用了一种新的数据结构 Remembered Set 简称Rset。**RSet记录了其他Region中的对象引用本Region中对象的关系，属于points-into结构（谁引用了我的对象）。而Card Table则是一种points-out（我引用了谁的对象）的结构，每个Card 覆盖一定范围的Heap（一般为512Bytes）。G1的RSet是在Card Table的基础上实现的：每个Region会记录下别的Region有指向自己的指针，并标记这些指针分别在哪些Card的范围内。 这个RSet其实是一个Hash Table，Key是别的Region的起始地址，Value是一个集合，里面的元素是Card Table的Index。**每个Region都有一个对应的Rset**。
 
-<div align="center"> <img src="pics/rset.jpeg"/> </div><br>
+<div align="center"> <img src="pics/rset.jpg"/> </div><br>
 
 RSet究竟是怎么辅助GC的呢？在做YGC的时候，只需要选定young generation region的RSet作为根集，这些RSet记录了old->young的跨代引用，避免了扫描整个old generation。 而mixed gc的时候，old generation中记录了old->old的RSet，young->old的引用由扫描全部young generation region得到，这样也不用扫描全部old generation region。所以RSet的引入大大减少了GC的工作量。
 
@@ -5771,7 +5781,7 @@ G1中的MIXGC选定所有新生代里的Region，外加根据global concurrent m
 
 (1) Initial Mark初始标记 STW
 
-Initial Mark初始标记是一个STW事件，其完成工作是标记GC ROOTS 直接可达的对象。并将它们的字段压入扫描栈（marking stack）中等到后续扫描。G1使用外部的bitmap来记录mark信息，而不使用对象头的mark word里的mark bit。因为 STW，所以通常YGC的时候借用YGC的STW顺便启动Initial Mark，也就是启动全局并发标记，全局并发标记与YGC在逻辑上独立。
+Initial Mark初始标记是一个STW事件，其完成工作是标记GC ROOTS 直接可达的对象。并将它们的字段压入扫描栈（marking stack）中等到后续扫描。G1使用外部的bitmap来记录mark信息，而不使用对象头的mark word里的mark bit。因为 STW，所以通常YGC的时候借用YGC的STW顺便启动Initial Mark，也就是启动全局并发标记，全局并发标记与YGC在逻辑上独立。initial mark往往伴随着一次YGC。
 
 > (1) Initial Mark
 > *(Stop the World Event)*This is a stop the world event. With G1, it is piggybacked on a normal young GC. Mark survivor regions (root regions) which may have references to objects in old generation.
@@ -5896,14 +5906,15 @@ SATB 利用 write barrier 将所有即将被删除的引用关系的旧引用记
 
 - 增大堆（内存)大小
 
-- - 增大**-XX:G1ReservePercent=n**，默认是10
+  + 增大**-XX:G1ReservePercent=n**，默认是10
+
   - G1会预留一部分内存，制造一个假天花板，当真正Evacuation Failure时还有内存可用。
 
 - 早点启动标记周期
 
 - 增大并行标记的线程数，使用**-XX:ConcGCThreads=n**选项。
 
-## 完整的G1 GC开关列表
+**完整的G1 GC开关列表**
 
 - -XX:+UseG1GC 使用G1 GC。
 - -XX:MaxGCPauseMillis=n 设置最大GC停顿时间，这是一个软目标，JVM会尽最大努力去达到它。
