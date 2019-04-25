@@ -5715,6 +5715,8 @@ https://blog.csdn.net/lijingyao8206/article/details/80513383
 
 https://www.jianshu.com/p/ac1ba3479c08
 
+https://hllvm-group.iteye.com/group/topic/44381
+
  G1 GC是设计用来取代CMS的，同CMS相比G1有以下优势：
 1、可预测的停顿模型
 2、避免了CMS的垃圾碎片
