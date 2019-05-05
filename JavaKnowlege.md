@@ -5705,13 +5705,17 @@ CMS（Concurrent Mark Sweep），Mark Sweep 指的是标记 - 清除算法。
 
 ###### 7. G1 收集器
 
-https://zhuanlan.zhihu.com/p/52841787
+[G1 收集器原理理解与分析](https://zhuanlan.zhihu.com/p/52841787)
 
 https://blog.csdn.net/lijingyao8206/article/details/80513383
 
-https://www.jianshu.com/p/ac1ba3479c08
+[请教G1算法的原理](https://hllvm-group.iteye.com/group/topic/44381)
 
-https://hllvm-group.iteye.com/group/topic/44381
+[gc paper](https://www.jianshu.com/p/b1609c81cd5f)
+
+https://blog.csdn.net/coderlius/article/details/79272773
+
+[G1日志解读](https://www.jianshu.com/p/ac1ba3479c08)
 
  G1 GC是设计用来取代CMS的，同CMS相比G1有以下优势：
 1、可预测的停顿模型
@@ -5760,7 +5764,7 @@ YoungGC的回收过程如下：
 
     根扫描,跟CMS类似，Stop the world，扫描GC Roots对象。
     处理Dirty card,更新RSet.
-    扫描RSet,扫描RSet中所有old区对扫描到的young区或者survivor去的引用。
+    扫描RSet,扫描RSet中所有old区对扫描到的young区或者survivor区的引用。
     拷贝扫描出的存活的对象到survivor2/old区
     处理引用队列，软引用，弱引用，虚引用
 **YGC是否需要扫描整个老年代？**
@@ -5827,6 +5831,13 @@ Concurrent操作，把Empty Region收集起来到可分配Region队列。
 
 **YGC与MIXGC都是采用多线程复制清除，整个过程会STW。 G1的低延迟原理在于其回收的区域变得精确并且范围变小了。**
 
+**并发标记，G1在mutator一侧需要使用write barrier来实现： **
+
+* SATB snapshot的完整性 
+* 跨region的引用记录到RSet里。 
+
+这两个动作都使用了logging barrier，其处理有一部分由collector一侧并发执行。
+
 **STAB**
 
 G1 使用的是 SATB 标记算法，主要应用于垃圾收集的并发标记阶段，解决了CMS 垃圾收 集器重新标记阶段长时间 Stop The World（STW） 的潜在风险。其算法全称是 Snapshot At The Beginning，由字面理解，是垃圾回收器开始时活着的对象的一个快照。
@@ -5852,6 +5863,7 @@ SATB 利用 write barrier 将所有即将被删除的引用关系的旧引用记
 
 **为了解决这个问题，STAB的做法在GC开始时对内存进行一个对象图的逻辑快照(snapshot)，通过GC Roots tracing 参照并发标记的过程，只要被快照到对象是活的，那在整个GC的过程中对象就被认定的是活的，即使该对象的引用稍后被修改或者删除。同时新分配的对象也会被认为是活的，除此之外其它不可达的对象就被认为是死掉了。这样STAB就保证了真正存活的对象不会被GC误回收，但同时也造成了某些可以被回收的对象逃过了GC，导致了内存里面存在浮动的垃圾(float garbage)。**
 
+
 **Full GC**
 
 下面我们来介绍特殊情况，那就是会导致 **Full GC** 的情况，也是我们需要极力避免的：
@@ -5874,9 +5886,156 @@ SATB 利用 write barrier 将所有即将被删除的引用关系的旧引用记
 
 4. 大对象分配失败，我们应该尽可能地不创建大对象，尤其是大于一个区块大小的那种对象。
 
+**STAB具体细节：**
+
+每个Region中都有那么几个指针
+
+|<-- (1) -->|<-- (2) -->|<-- (3) -->|<-- (4) -->|
+bottom prevTAMS nextTAMS top end
+
+<div align="center"> <img src="pics/g1_bitmap.jpg"/> </div><br>
+
+其中top是该region的当前分配指针，[bottom, top)是当前该region已用（used）的部分，[top, end)是尚未使用的可分配空间（unused）。
+
+(1): [bottom, prevTAMS): 这部分里的对象存活信息可以通过prevBitmap来得知
+
+(2): [prevTAMS, nextTAMS): 这部分里的对象在第n-1轮concurrent marking是隐式存活的
+
+(3): [nextTAMS, top): 这部分里的对象在第n轮concurrent marking是隐式存活的
+
+为什么会用prevTAMS和nextTAMS两个指针？
+
+因为G1的并发标记的过程用了两个bitmap：
+
+一个prevBitmap记录第n-1轮concurrent mark所得的对象存活状态。由于第n－1轮concurrent marking已经完成，这个bitmap的信息可以直接使用。
+
+一个nextBitmap记录第n轮concurrent mark的结果。这个bitmap是当前将要或正在进行的concurrent mark的结果，尚未完成，所以还不能使用。
+
+所以Region会同时存在prevTAMS和nextTAMS两个指针，这两个指针是在 Initial Mark阶段就会设置好。
+
+所以我们很容易知道哪些对象在一次GC开始之后新分配的：在TAMS以上的对象就是新分配的，因而被视为隐式marked，标记为存活。
+
+切换到另外一个场景：如果在标记的过程中mark了某个对象但对象中某些引用这字段还没有被mark到,此时应用并发修改引用字段的值，那collecotr就拿不到完整的快照了，这不符合STAB的设想。
+
+为了解决这个问题就有了SATB write barrier。G1 GC具体使用的是Yuasa式的SATB write barrier的变种。Write barrier是对“对引用类型字段赋值”这个动作的环切，也就是说赋值的前后都在barrier覆盖的范畴内。在赋值前的部分的write barrier叫做pre-write barrier，在赋值后的则叫做post-write barrier。
+
+<div align="center"> <img src="pics/write_barrier.jpg"/> </div><br>
+
+**栅栏 Barrier**
+
+我们首先介绍一下栅栏(Barrier)的概念。栅栏是指在原生代码片段中，当某些语句被执行时，栅栏代码也会被执行。而G1主要在赋值语句中，使用写前栅栏(Pre-Write Barrrier)和写后栅栏(Post-Write Barrrier)。事实上，写栅栏的指令序列开销非常昂贵，应用吞吐量也会根据栅栏复杂度而降低。
+
+**写前栅栏 Pre-Write Barrrier**
+
+即将执行一段赋值语句时，等式左侧对象将修改引用到另一个对象，那么等式左侧对象原先引用的对象所在分区将因此丧失一个引用，那么JVM就需要在赋值语句生效之前，记录丧失引用的对象。JVM并不会立即维护RSet，而是通过批量处理，在将来RSet更新(见SATB)。
+
+**写后栅栏 Post-Write Barrrier**
+
+​	当执行一段赋值语句后，等式右侧对象获取了左侧对象的引用，那么等式右侧对象所在分区的RSet也应该得到更新。同样为了降低开销，写后栅栏发生后，RSet也不会立即更新，同样只是记录此次更新日志，在将来批量处理(见Concurrence Refinement Threads)。
+
+​	跟SATB marking queue类似，每个Java线程有一个dirty card queue，也就是论文里说的每个线程的remembered set log；然后有一个全局的DirtyCardQueueSet，也就是论文里说的全局的filled RS buffers。 
+实际更新RSet的动作就交由多个ConcurrentG1RefineThread并发完成。每当全局队列集合超过一定阈值后，ConcurrentG1RefineThread就会取出若干个队列，遍历每个队列记录的card并将card加到对应的region的RSet里去。 
+
+**1、Pre/Post-write barrier与SATB的关系**
+
+​	前面提到SATB要维持“在GC开始时活的对象”的状态这个逻辑snapshot。除了从root出发把整个对象图mark下来之外，其实只需要用pre-write barrier把每次引用关系变化时旧的引用值记下来就好了。这样，等concurrent marker到达某个对象时，这个对象的所有引用类型字段的变化全都有记录在案，就不会漏掉任何在snapshot里活的对象。当然，很可能有对象在snapshot中是活的，但随着并发GC的进行它可能本来已经死了，但SATB还是会让它活过这次GC。
+
+​	所以在G1 GC里，整个write barrier+oop_field_store是这样的：
+
+```cpp
+void oop_field_store(oop* field, oop new_value) {
+  pre_write_barrier(field);             // pre-write barrier: for maintaining SATB invariant
+  *field = new_value;                   // the actual store
+  post_write_barrier(field, new_value); // post-write barrier: for tracking cross-region reference
+}
+```
+
+按照Yuasa式SATB barrier的设计，pre-write barrier里面的抽象逻辑应当如下：
+
+```cpp
+void pre_write_barrier(oop* field) {
+  if ($gc_phase == GC_CONCURRENT_MARK) { // SATB invariant only maintained during concurrent marking
+    oop old_value = *field;
+    if (old_value != null && !is_marked(old_value)) {
+      mark_object(old_value);
+      $mark_stack->push(old_value); // scan all of old_value's fields later
+    }
+  }
+}
+```
+
+​	这比原本的Yuasa式设计少了些东西：没有检查目标对象是否已经mark，也不去对目标对象做mark和扫描它的字段。实际上该做的事情还是得做，只是不在这里做而已。那放在那里做呢放到了后面的logging barrier，这个后面讲到。
+
+Pre-write barrier的实际代码有好几个版本，其中最简单明白的版本是：
+
+```cpp
+  // This notes that we don't need to access any BarrierSet data
+  // structures, so this can be called from a static context.
+  template <class T> static void write_ref_field_pre_static(T* field, oop newVal) {
+    T heap_oop = oopDesc::load_heap_oop(field);
+    if (!oopDesc::is_null(heap_oop)) {
+      enqueue(oopDesc::decode_heap_oop(heap_oop));
+    }
+  }
+```
+
+enqueue动作的实际代码则在G1SATBCardTableModRefBS::enqueue(oop pre_val)。
+
+它判断当前是否在concurrent marking phase用的是：
+
+```cpp
+JavaThread::satb_mark_queue_set().is_active()  
+```
+
+为了维持这种RSet，G1 GC的post-write barrier的抽象逻辑需要做下面的事情： 
+
+There are two concepts that help maintain RSets:
+
+1. Post-write barriers
+2. Concurrent refinement threads
+
+```cpp
+void post_write_barrier(oop* field, oop new_value) {  
+  uintptr_t field_uint = (uintptr_t) field;  
+  uintptr_t new_value_uint = (uintptr_t) new_value;  
+  uintptr_t comb = (field_uint ^ new_value_uint) >> HeapRegion::LogOfHRGrainBytes;  
+  
+  if (comb == 0) return; // field and new_value are in the same region  
+  if (new_value == null) return; // filter out null stores  
+  
+  // Otherwise, log it  
+  volatile jbyte* card_ptr = card_for(field); // get address of the card for this field  
+  
+  // in generational G1 mode, skip dirtying cards for young gen regions,  
+  // -- young gen regions are always collected  
+  // if (*card_ptr == g1_young_gen) return;  
+  
+  if (*card_ptr != dirty_card) {  
+    // dirty the card to reduce the work for multiple stores to the same card  
+    *card_ptr = dirty_card;  
+    // log the card for concurrent remembered set refinement  
+    JavaThread::current()->dirty_card_queue->enqueue(card_ptr);  
+  }  
+} 
+```
+
+这是logging barrier在G1 write barrier上的又一次应用。 
+
+​	跟SATB marking queue类似，每个Java线程有一个dirty card queue，也就是论文里说的每个线程的remembered set log；然后有一个全局的DirtyCardQueueSet，也就是论文里说的全局的filled RS buffers。 
+实际更新RSet的动作就交由多个ConcurrentG1RefineThread并发完成。每当全局队列集合超过一定阈值后，ConcurrentG1RefineThread就会取出若干个队列，遍历每个队列记录的card并将card加到对应的region的RSet里去。 
+
+**2、logging write barrier**
+
+​	为了尽量减少write barrier对应用mutator性能的影响，G1将一部分原本要在barrier里做的事情挪到别的线程上并发执行。 
+实现这种分离的方式就是通过logging形式的write barrier：mutator只在barrier里把要做的事情的信息记（log）到一个队列里，然后另外的线程从队列里取出信息批量完成剩余的动作。 
+
+​	以SATB write barrier为例，每个Java线程有一个独立的、定长的SATBMarkQueue，mutator在barrier里只把old_value压入该队列中。一个队列满了之后，它就会被加到全局的SATB队列集合SATBMarkQueueSet里等待处理，然后给对应的Java线程换一个新的、干净的队列继续执行下去。 
+
+​	并发标记（concurrent marker）会定期检查全局SATB队列集合的大小。当全局集合中队列数量超过一定阈值后，concurrent marker就会处理集合里的所有队列：把队列里记录的每个oop都标记上，并将其引用字段压到标记栈（marking stack）上等后面做进一步标记。
+
 **简单理解**
 
-每个 Region 都有一个 Remembered Set，用来记录该 Region 对象的引用对象所在的 Region。通过使用 Remembered Set，在做可达性分析的时候就可以避免全堆扫描。
+​	每个 Region 都有一个 Remembered Set，用来记录该 Region 对象的引用对象所在的 Region。通过使用 Remembered Set，在做可达性分析的时候就可以避免全堆扫描。
 
 <div align="center"> <img src="pics/f99ee771-c56f-47fb-9148-c0036695b5fe.jpg" width=""/> </div><br>
 
@@ -5952,6 +6111,97 @@ SATB 利用 write barrier 将所有即将被删除的引用关系的旧引用记
 - -XX:ConcGCThreads=n 设置并发标记的线程数，默认值与JVM运行平台相关。
 - -XX:G1ReservePercent=n 设置保留java堆大小比例，用于防止晋升失败/Evacuation Failure,默认值是10%。
 - -XX:G1HeapRegionSize=n 设置Region的大小，默认是根据堆的大小动态决定，大小范围是[1M,32M]
+-  -XX:G1ConcRefinementThreads=n:默认等于ParallelGCThreads，g1优化线程数（处理全局的DirtyCardQueueSet，也就是论文里说的全局的filled RS buffers）
+- -XX:G1RSetUpdatingPauseTimePercent=10:默认10，更新Rset占gc暂停时间（GC evacuation pause）的比例
+- –XX:G1MixedGCLiveThresholdPercent: old generation region中的存活对象的占比，只有在此参数之下，才会被选入CSet
+- –XX:G1MixedGCCountTarget: 一次global concurrent marking之后，最多执行Mixed GC的次数。与G1MixedGCLIveThresholdPercent参数合用
+- –XX:G1HeapWastePercent: 设置您愿意浪费的堆百分比。如果可回收百分比小于堆废物百分比，Java HotSpot VM 不会启动混合垃圾回收周期。默认值是 10%
+- –XX:G1OldCSetRegionThresholdPercent: 设置混合垃圾回收期间要回收的最大旧区域数。默认值是 Java 堆的 10%。
+
+**使用G1记录GC**
+
+这里简要介绍可以用来收集GC日志信息的相关配置开关。
+
+**1、日志详细级别**
+
+**(1) -verbosegc(相当于-XX:+PrintGC)**将日志的详细级别设置为详细。
+
+样例输出
+
+> [GC pause (G1 Humongous Allocation) (young) (initial-mark) 24M- >21M(64M), 0.2349730 secs]
+> [GC pause (G1 Evacuation Pause) (mixed) 66M->21M(236M), 0.1625268 secs] 
+
+**(2) -XX:+PrintGCDetails**将细节级别设置为更精细。选项显示以下信息:
+
+显示每个阶段的平均时间、最小时间和最大时间。
+
+根扫描、RSet更新(带有已处理缓冲区信息)、RSet扫描、对象复制、终止(带有尝试次数)。
+
+还显示“其他”时间，如选择CSet所花费的时间、引用处理时间、引用排队时间和释放CSet时间。
+
+显示Eden、Survivor空间和总堆占用率。
+
+样例输出
+
+> [Ext Root Scanning (ms): Avg: 1.7 Min: 0.0 Max: 3.7 Diff: 3.7]
+> [Eden: 818M(818M)->0B(714M) Survivors: 0B->104M Heap: 836M(4096M)->409M(4096M)]
+
+**(3)-XX:+UnlockExperimentalVMOptions -XX:G1LogLevel=finest** 细节级别最为精细。精细到单个工作线程信息
+
+样例输出
+
+> [Ext Root Scanning (ms): 2.1 2.4 2.0 0.0
+> Avg: 1.6 Min: 0.0 Max: 2.4 Diff: 2.3]
+> [Update RS (ms): 0.4 0.2 0.4 0.0
+> Avg: 0.2 Min: 0.0 Max: 0.4 Diff: 0.4]
+> [Processed Buffers : 5 1 10 0
+> Sum: 16, Avg: 4, Min: 0, Max: 10, Diff: 10]
+
+**(4))-XX:+UnlockExperimentalVMOptions  -XX:+G1SummarizeRSetStats** **-XX:G1SummarizeRSetStatsPeriod=period** 
+
+>A sample output of **-XX:+G1SummarizeRSetStats** with the period set to one **-XX:G1SummarizeRSetStatsPeriod=1:**
+>Concurrent RS processed 784125 cards
+>
+>Of 4870 completed buffers:
+>
+>4870 **(100.0%) by concurrent RS threads.**
+>
+>0 ( **0.0%) by mutator threads**.
+>
+>Concurrent RS threads times (s)
+>
+>0.64 0.30 0.26 0.18 0.17 0.16 0.17 0.15 0.15 0.12 0.13 0.08 0.13 0.13 0.12 0.13 0.12 0.11 0.12 0.11 0.12 0.13 0.11
+>
+>Concurrent sampling threads times (s)
+>
+>0.00
+>
+>Total heap region rem set sizes = 199140K. Max = 661K.
+>
+>Static structures = 660K, free_lists = 15052K.
+>
+>1009422114 occupied cards represented.
+>
+>Max size region =
+>313:(O)[0x000000054e400000,0x000000054e800000,0x000000054e800000], size = 662K, occupied = 1214K.
+>
+>Did 2759 coarsenings.
+
+**2、时间打印**
+
+这里有两个关于时间的开关
+
+**(1)** **-XX:+PrintGCTimeStamps** - 显示JVM启动后经过的时间。
+
+样例输出
+
+> 1.729: [GC pause (young) 46M->35M(1332M), 0.0310029 secs]
+
+**(2)** **-XX:+PrintGCDateStamps** - 为每个条目添加日期前缀。
+
+样例输出
+
+> 2012-05-02T11:16:32.057+0200: [GC pause (young) 46M->35M(1332M), 0.0317225 secs]
 
 ##### 总结
 
@@ -6012,7 +6262,7 @@ http://www.importnew.com/23761.html
 
 3. dump文件使用**Eclipse mat**分析
 
-##### Young Gc标记过程
+##### CMS Young Gc标记过程
 
 1. 标记直接和根引用的对象
 2. 标记间接和根引用的对象
