@@ -1,4 +1,4 @@
-# JAVA 知识点（2-3个月完成）
+# JAVA 知识点
 
 ## 一、JAVA基础（Jdk 8为准）
 
@@ -5088,6 +5088,420 @@ public class SemaphoreExample {
 ##### FutureTask
 
 [FutureTask源码解读](https://segmentfault.com/a/1190000016572591)
+
+**Java并发工具类的三板斧***
+
+关于Java并发工具类的三板斧，我们在分析[AQS源码](https://segmentfault.com/a/1190000015739343)的时候已经说过了,即：
+
+> **状态，队列，CAS**
+
+以这三个方面为切入点来看源码，有助于我们快速的看清FutureTask的概貌：
+
+**状态**
+
+首先是找状态。
+
+在FutureTask中，状态是由state属性来表示的，不出所料，它是volatile类型的，确保了不同线程对它修改的可见性：
+
+```java
+private volatile int state;
+private static final int NEW          = 0;
+private static final int COMPLETING   = 1;
+private static final int NORMAL       = 2;
+private static final int EXCEPTIONAL  = 3;
+private static final int CANCELLED    = 4;
+private static final int INTERRUPTING = 5;
+private static final int INTERRUPTED  = 6;
+```
+
+state属性是贯穿整个FutureTask的最核心的属性，该属性的值代表了任务在运行过程中的状态，随着任务的执行，状态将不断地进行转变，从上面的定义中可以看出，总共有7种状态：包括了1个初始态，2个中间态和4个终止态。
+
+虽说状态有这么多，但是状态的转换路径却只有四种：
+
+<div align="center"> <img src="pics/futureTaskState.png"/></div><br>
+
+**队列**
+
+接着我们来看队列，在FutureTask中，队列的实现是一个单向链表，它表示**所有等待任务执行完毕的线程的集合**。我们知道，FutureTask实现了Future接口，可以获取“Task”的执行结果，那么如果获取结果时，任务还没有执行完毕怎么办呢？那么获取结果的线程就会在一个等待队列中挂起，直到任务执行完毕被唤醒。这一点有点类似于我们之前学习的[AQS](https://segmentfault.com/a/1190000015739343)中的`sync queue`，在下文的分析中，大家可以自己对照它们的异同点。
+
+我们前面说过，在并发编程中使用队列通常是**将当前线程包装成某种类型的数据结构扔到等待队列中**，我们先来看看队列中的每一个节点是怎么个结构：
+
+```java
+static final class WaitNode {
+    volatile Thread thread;
+    volatile WaitNode next;
+    WaitNode() { thread = Thread.currentThread(); }
+}
+```
+
+可见，相比于AQS的`sync queue`所使用的双向链表中的Node，这个WaitNode要简单多了，它只包含了一个记录线程的`thread`属性和指向下一个节点的`next`属性。
+
+值得一提的是，FutureTask中的这个单向链表是当做**栈**来使用的，确切来说是当做Treiber栈来使用的，不了解Treiber栈是个啥的可以简单的把它当做是一个线程安全的栈，它使用CAS来完成入栈出栈操作(想进一步了解的话可以看[这篇文章](https://segmentfault.com/a/1190000012463330))。为啥要使用一个线程安全的栈呢，因为同一时刻可能有多个线程都在获取任务的执行结果，如果任务还在执行过程中，则这些线程就要被包装成`WaitNode`扔到Treiber栈的栈顶，即完成入栈操作，这样就有可能出现多个线程同时入栈的情况，因此需要使用CAS操作保证入栈的线程安全，对于出栈的情况也是同理。
+
+由于FutureTask中的队列本质上是一个Treiber栈，那么使用这个队列就只需要一个指向栈顶节点的指针就行了，在FutureTask中，就是`waiters`属性：
+
+```java
+/** Treiber stack of waiting threads */
+private volatile WaitNode waiters;
+```
+
+事实上，它就是整个单向链表的头节点。
+
+综上，FutureTask中所使用的队列的结构如下：
+
+<div align="center"> <img src="pics/treiber.png"/> </div><br>
+
+
+
+**get()**
+
+最后我们来看看获取执行结果的get方法，先来看看无参的版本：
+
+```java
+public V get() throws InterruptedException, ExecutionException {
+    int s = state;
+    if (s <= COMPLETING)
+        s = awaitDone(false, 0L);
+    return report(s);
+}
+```
+
+该方法其实很简单，当任务还没有执行完毕或者正在设置执行结果时，我们就使用`awaitDone`方法等待任务进入终止态，注意，**awaitDone的返回值是任务的状态，而不是任务的结果**。任务进入终止态之后，我们就根据任务的执行结果来返回计算结果或者抛出异常。
+
+我们先来看看等待任务完成的`awaitDone`方法，该方法是获取任务结果最核心的方法，它完成了获取结果，挂起线程，响应中断等诸多操作：
+
+```
+private int awaitDone(boolean timed, long nanos) throws InterruptedException {
+    final long deadline = timed ? System.nanoTime() + nanos : 0L;
+    WaitNode q = null;
+    boolean queued = false;
+    for (;;) {
+        if (Thread.interrupted()) {
+            removeWaiter(q);
+            throw new InterruptedException();
+        }
+        int s = state;
+        if (s > COMPLETING) {
+            if (q != null)
+                q.thread = null;
+            return s;
+        }
+        else if (s == COMPLETING) // cannot time out yet
+            Thread.yield();
+        else if (q == null)
+            q = new WaitNode();
+        else if (!queued)
+            queued = UNSAFE.compareAndSwapObject(this, waitersOffset,
+                                                 q.next = waiters, q);
+        else if (timed) {
+            nanos = deadline - System.nanoTime();
+            if (nanos <= 0L) {
+                removeWaiter(q);
+                return state;
+            }
+            LockSupport.parkNanos(this, nanos);
+        }
+        else
+            LockSupport.park(this);
+    }
+}
+```
+
+在具体分析它的源码之前，有一点我们先特别说明一下，FutureTask中会涉及到两类线程，一类是执行任务的线程，它只有一个，FutureTask的run方法就由该线程来执行；一类是获取任务执行结果的线程，它可以有多个，这些线程可以并发执行，每一个线程都是独立的，都可以调用get方法来获取任务的执行结果。如果任务还没有执行完，则这些线程就需要进入Treiber栈中挂起，直到任务执行结束，或者等待的线程自身被中断。
+
+理清了这一点后，我们再来详细看看`awaitDone`方法。可以看出，该方法的大框架是一个自旋操作，我们一段一段来看:
+
+```
+for (;;) {
+    if (Thread.interrupted()) {
+        removeWaiter(q);
+        throw new InterruptedException();
+    }
+    // ...
+}
+```
+
+首先一开始，我们先检测当前线程是否被中断了，这是因为get方法是阻塞式的，如果等待的任务还没有执行完，则调用get方法的线程会被扔到Treiber栈中挂起等待，直到任务执行完毕。但是，如果任务迟迟没有执行完毕，则我们也有可能直接中断在Treiber栈中的线程，以停止等待。
+
+当检测到线程被中断后，我们调用了removeWaiter:
+
+```
+private void removeWaiter(WaitNode node) {
+    if (node != null) {
+        ...
+    }
+}
+```
+
+`removeWaiter`的作用是将参数中的node从等待队列（即Treiber栈）中移除。如果此时线程还没有进入Treiber栈，则 q=null，那么removeWaiter(q)啥也不干。在这之后，我们就直接抛出了`InterruptedException`异常。
+
+接着往下看：
+
+```
+for (;;) {
+    /*if (Thread.interrupted()) {
+        removeWaiter(q);
+        throw new InterruptedException();
+    }*/
+    int s = state;
+    if (s > COMPLETING) {
+        if (q != null)
+            q.thread = null;
+        return s;
+    }
+    else if (s == COMPLETING) // cannot time out yet
+        Thread.yield();
+    else if (q == null)
+        q = new WaitNode();
+    else if (!queued)
+        queued = UNSAFE.compareAndSwapObject(this, waitersOffset,
+                                             q.next = waiters, q);
+    else if (timed) {
+        nanos = deadline - System.nanoTime();
+        if (nanos <= 0L) {
+            removeWaiter(q);
+            return state;
+        }
+        LockSupport.parkNanos(this, nanos);
+    }
+    else
+        LockSupport.park(this);
+}
+```
+
+- 如果任务已经进入终止态（`s > COMPLETING`），我们就直接返回任务的状态;
+- 否则，如果任务正在设置执行结果（`s == COMPLETING`），我们就让出当前线程的CPU资源继续等待
+- 否则，就说明任务还没有执行，或者任务正在执行过程中，那么这时，如果q现在还为null, 说明当前线程还没有进入等待队列，于是我们新建了一个`WaitNode`, `WaitNode`的构造函数我们之前已经看过了，就是生成了一个记录了当前线程的节点；
+- 如果q不为null，说明代表当前线程的WaitNode已经被创建出来了，则接下来如果`queued=false`，表示当前线程还没有入队，所以我们执行了:
+
+```
+queued = UNSAFE.compareAndSwapObject(this, waitersOffset, q.next = waiters, q);
+```
+
+这行代码的作用是通过CAS操作将新建的q节点添加到`waiters`链表的头节点之前，**其实就是Treiber栈的入栈操作**，写的还是很简洁的，一行代码就搞定了，如果大家还是觉得晕乎，下面是它等价的伪代码：
+
+```
+q.next = waiters; //当前节点的next指向目前的栈顶元素
+//如果栈顶节点在这个过程中没有变，即没有发生并发入栈的情况
+if(waiters的值还是上面q.next所使用的waiters值){ 
+    waiters = q; //修改栈顶的指针，指向刚刚入栈的节点
+}
+```
+
+这个CAS操作就是为了保证同一时刻如果有多个线程在同时入栈，则只有一个能够操作成功，也即Treiber栈的规范。
+
+如果以上的条件都不满足，则再接下来因为现在是不带超时机制的get，timed为false，则`else if`代码块跳过，然后来到最后一个else, 把当前线程挂起，此时线程就处于阻塞等待的状态。
+
+
+
+至此，在任务没有执行完毕的情况下，获取任务执行结果的线程就会在Treiber栈中被`LockSupport.park(this)`挂起了。
+
+那么这个挂起的线程什么时候会被唤醒呢？有两种情况：
+
+1. 任务执行完毕了，在`finishCompletion`方法中会唤醒所有在Treiber栈中等待的线程
+2. 等待的线程自身因为被中断等原因而被唤醒。
+
+我们接下来就继续看看线程被唤醒后的情况，此时，线程将回到`for(;;)`循环的开头，继续下一轮循环：
+
+```
+for (;;) {
+    if (Thread.interrupted()) {
+        removeWaiter(q);
+        throw new InterruptedException();
+    }
+
+    int s = state;
+    if (s > COMPLETING) {
+        if (q != null)
+            q.thread = null;
+        return s;
+    }
+    else if (s == COMPLETING) // cannot time out yet
+        Thread.yield();
+    else if (q == null)
+        q = new WaitNode();
+    else if (!queued)
+        queued = UNSAFE.compareAndSwapObject(this, waitersOffset,
+                                             q.next = waiters, q);
+    else if (timed) {
+        nanos = deadline - System.nanoTime();
+        if (nanos <= 0L) {
+            removeWaiter(q);
+            return state;
+        }
+        LockSupport.parkNanos(this, nanos);
+    }
+    else
+        LockSupport.park(this); // 挂起的线程从这里被唤醒
+}
+```
+
+首先自然还是检测中断，所不同的是，此时q已经不为null了，因此在有中断发生的情况下，在抛出中断之前，多了一步removeWaiter(q)操作，该操作是将当前线程从等待的Treiber栈中移除，相比入栈操作，这个出栈操作要复杂一点，这取决于节点是否位于栈顶。下面我们来仔细分析这个出栈操作：
+
+```
+private void removeWaiter(WaitNode node) {
+    if (node != null) {
+        node.thread = null;
+        retry:
+        for (;;) {          // restart on removeWaiter race
+            for (WaitNode pred = null, q = waiters, s; q != null; q = s) {
+                s = q.next;
+                if (q.thread != null)
+                    pred = q;
+                else if (pred != null) {
+                    pred.next = s;
+                    if (pred.thread == null) // check for race
+                        continue retry;
+                }
+                else if (!UNSAFE.compareAndSwapObject(this, waitersOffset, q, s))
+                    continue retry;
+            }
+            break;
+        }
+    }
+}
+```
+
+首先，我们把要出栈的WaitNode的thread属性设置为null, 这相当于一个**标记**，是我们后面在waiters链表中定位该节点的依据。
+
+(1) 要移除的节点就在栈顶
+
+我们先来看看该节点就位于栈顶的情况，这说明在该节点入栈后，并没有别的线程再入栈了。由于一开始我们就将该节点的thread属性设为了null，因此，前面的`q.thread != null` 和 `pred != null`都不满足，我们直接进入到最后一个else if 分支：
+
+```
+else if (!UNSAFE.compareAndSwapObject(this, waitersOffset, q, s))
+    continue retry;
+```
+
+这一段是栈顶节点出栈的操作，和入栈类似，采用了CAS比较，将栈顶元素设置成原栈顶节点的下一个节点。
+
+值得注意的是，当CAS操作不成功时，程序会回到retry处重来，**但即使CAS操作成功了，程序依旧会遍历完整个链表**，找寻node.thread == null 的节点，并将它们一并从链表中剔除。
+
+(2) 要移除的节点不在栈顶
+
+当要移除的节点不在栈顶时，我们会一直遍历整个链表，直到找到`q.thread == null`的节点，找到之后，我们将进入
+
+```
+else if (pred != null) {
+    pred.next = s;
+    if (pred.thread == null) // check for race
+        continue retry;
+}
+```
+
+这是**因为节点不在栈顶，则其必然是有前驱节点pred的**，这时，我们只是简单的让前驱节点指向当前节点的下一个节点，从而将目标节点从链表中剔除。
+
+注意，后面多加的那个if判断是很有必要的，因为`removeWaiter`方法并没有加锁，所以可能有多个线程在同时执行，WaitNode的两个成员变量`thread`和`next`都被设置成volatile，这保证了它们的可见性，如果我们在这时发现了`pred.thread == null`，那就意味着它已经被另一个线程标记了，将在另一个线程中被拿出`waiters`链表，而我们当前目标节点的原后继节点现在是接在这个pred节点上的，因此，如果pred已经被其他线程标记为要拿出去的节点，我们现在这个线程再继续往后遍历就没有什么意义了，所以这时就调到retry处，从头再遍历。
+
+如果pred节点没有被其他线程标记，那我们就接着往下遍历，直到整个链表遍历完。
+
+至此，将节点从waiters链表中移除的removeWaiter操作我们就分析完了，我们总结一下该方法：
+
+在该方法中，会传入一个需要移除的节点，我们会将这个节点的`thread`属性设置成null，以标记该节点。然后无论如何，我们会遍历整个链表，清除那些被标记的节点（只是简单的将节点从链表中剔除）。如果要清除的节点就位于栈顶，则还需要注意重新设置`waiters`的值，指向新的栈顶节点。所以可以看出，虽说removeWaiter方法传入了需要剔除的节点，但是事实上它可能剔除的不止是传入的节点，而是所有已经被标记了的节点，这样不仅清除操作容易了些（不需要专门去定位传入的node在哪里），而且提升了效率（可以同时清除所有已经被标记的节点）。
+
+我们再回到`awaitDone`方法里：
+
+```
+private int awaitDone(boolean timed, long nanos) throws InterruptedException {
+    final long deadline = timed ? System.nanoTime() + nanos : 0L;
+    WaitNode q = null;
+    boolean queued = false;
+    for (;;) {
+        if (Thread.interrupted()) {
+            removeWaiter(q); // 刚刚分析到这里了，我们接着往下看
+            throw new InterruptedException();
+        }
+
+        int s = state;
+        if (s > COMPLETING) {
+            if (q != null)
+                q.thread = null;
+            return s;
+        }
+        else if (s == COMPLETING) // cannot time out yet
+            Thread.yield();
+        else if (q == null)
+            q = new WaitNode();
+        else if (!queued)
+            queued = UNSAFE.compareAndSwapObject(this, waitersOffset,
+                                                 q.next = waiters, q);
+        else if (timed) {
+            nanos = deadline - System.nanoTime();
+            if (nanos <= 0L) {
+                removeWaiter(q);
+                return state;
+            }
+            LockSupport.parkNanos(this, nanos);
+        }
+        else
+            LockSupport.park(this);
+    }
+}
+```
+
+如果线程不是因为中断被唤醒，则会继续往下执行，此时会再次获取当前的`state`状态。所不同的是，此时q已经不为null, queued已经为true了，所以已经不需要将当前节点再入waiters栈了。
+
+至此我们知道，除非被中断，否则get方法会在原地自旋等待(用的是Thread.yield，对应于`s == COMPLETING`)或者直接挂起（对应任务还没有执行完的情况），直到任务执行完成。而我们前面分析run方法和cancel方法的时候知道，在run方法结束后，或者cancel方法取消完成后，都会调用`finishCompletion()`来唤醒挂起的线程，使它们得以进入下一轮循环，获取任务执行结果。
+
+
+
+最后，等awaitDone函数返回后，get方法返回了`report(s)`，以根据任务的状态，汇报执行结果:
+
+```
+@SuppressWarnings("unchecked")
+private V report(int s) throws ExecutionException {
+    Object x = outcome;
+    if (s == NORMAL)
+        return (V)x;
+    if (s >= CANCELLED)
+        throw new CancellationException();
+    throw new ExecutionException((Throwable)x);
+}
+```
+
+可见，report方法非常简单，它根据当前state状态，返回正常执行的结果，或者抛出指定的异常。
+
+至此，get方法就分析结束了。
+
+值得注意的是，`awaitDone`方法和get方法都没有加锁，这在多个线程同时执行get方法的时候会不会产生线程安全问题呢？通过查看方法内部的参数我们知道，整个方法内部用的大多数是局部变量，因此不会产生线程安全问题，对于全局的共享变量`waiters`的修改时，也使用了CAS操作，保证了线程安全，而state变量本身是volatile的，保证了读取时的可见性，因此整个方法调用虽然没有加锁，它仍然是线程安全的。
+
+**get(long timeout, TimeUnit unit)**
+
+最后我们来看看带超时版本的get方法：
+
+```
+public V get(long timeout, TimeUnit unit) throws InterruptedException, ExecutionException, TimeoutException {
+    if (unit == null)
+        throw new NullPointerException();
+    int s = state;
+    if (s <= COMPLETING && (s = awaitDone(true, unit.toNanos(timeout))) <= COMPLETING)
+        throw new TimeoutException();
+    return report(s);
+}
+```
+
+它和上面不带超时时间的get方法很类似，只是在`awaitDone`方法中多了超时检测：
+
+```
+else if (timed) {
+    nanos = deadline - System.nanoTime();
+    if (nanos <= 0L) {
+        removeWaiter(q);
+        return state;
+    }
+    LockSupport.parkNanos(this, nanos);
+}
+```
+
+即，如果指定的超时时间到了，则直接返回，如果返回时，任务还没有进入终止状态，则直接抛出`TimeoutException`异常，否则就像`get()`方法一样，正常的返回执行结果。
+
+**总结**
+
+FutureTask实现了Runnable和Future接口，它表示了一个带有任务状态和任务结果的任务，**它的各种操作都是围绕着任务的状态展开的**，值得注意的是，在所有的7个任务状态中，只要不是`NEW`状态，就表示任务已经执行完毕或者不再执行了，并没有表示“任务正在执行中”的状态。  
+
+除了代表了任务的Callable对象、代表任务执行结果的outcome属性，FutureTask还包含了一个代表所有等待任务结束的线程的Treiber栈，这一点其实和各种锁的等待队列特别像，即如果拿不到锁，则当前线程就会被扔进等待队列中；这里则是如果任务还没有执行结束，则所有等待任务执行完毕的线程就会被扔进Treiber栈中，直到任务执行完毕了，才会被唤醒。
+
+FutureTask虽然为我们提供了获取任务执行结果的途径，遗憾的是，在获取任务结果时，如果任务还没有执行完成，则当前线程会自旋或者挂起等待，这和我们实现异步的初衷是相违背的，我们后面将继续介绍另一个同步工具类CompletableFuture,  它解决了这个问题。
 
 在介绍 Callable 时我们知道它可以有返回值，返回值通过 Future<V> 进行封装。FutureTask 实现了 RunnableFuture 接口，该接口继承自 Runnable 和 Future<V> 接口，这使得 FutureTask 既可以当做一个任务执行，也可以有返回值。
 
