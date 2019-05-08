@@ -5122,7 +5122,7 @@ state属性是贯穿整个FutureTask的最核心的属性，该属性的值代�
 
 虽说状态有这么多，但是状态的转换路径却只有四种：
 
-<div align="center"> <img src="pics/futureTaskState.png"/></div><br>
+<div align="center"><img src="pics/futureTaskState.png"/></div><br>
 
 **队列**
 

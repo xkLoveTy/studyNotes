@@ -8,7 +8,7 @@ package com.study.notes.dynamic;
 public class CoinChange {
 
     public static void main(String[] args) {
-        int[] coins = {2, 5, 7};
+        int[] coins = {7, 5, 2};
         int amount = 27;
 
         System.out.println(coinChange(coins, amount));
