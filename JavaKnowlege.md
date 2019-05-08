@@ -2603,6 +2603,8 @@ List list = Arrays.asList(1, 2, 3);
 
 #### 三、源码分析
 
+[Java8容器源码](http://cmsblogs.com/?p=3980)
+
 如果没有特别说明，以下源码分析基于 JDK 1.8。
 
 在 IDEA 中 double shift 调出 Search EveryWhere，查找源码文件，找到之后就可以阅读源码。
@@ -4463,6 +4465,8 @@ after
 
 java.util.concurrent（J.U.C）大大提高了并发性能，AQS 被认为是 J.U.C 的核心。
 
+[同步工具源码解析](https://segmentfault.com/a/1190000016058789)
+
 ##### [AQS原理](https://juejin.im/post/5aeb07ab6fb9a07ac36350c8)
 
 ​	AQS：AbstractQueuedSynchronizer，即队列同步器。它是构建锁或者其他同步组件的基础框架（如ReentrantLock、ReentrantReadWriteLock、Semaphore等），JUC并发包的作者（**Doug Lea**）期望它能够成为实现大部分同步需求的基础。它是JUC并发包中的核心基础组件。
@@ -5089,7 +5093,7 @@ public class SemaphoreExample {
 
 [FutureTask源码解读](https://segmentfault.com/a/1190000016572591)
 
-**Java并发工具类的三板斧***
+**Java并发工具类的三板斧**
 
 关于Java并发工具类的三板斧，我们在分析[AQS源码](https://segmentfault.com/a/1190000015739343)的时候已经说过了,即：
 
@@ -5151,8 +5155,6 @@ private volatile WaitNode waiters;
 
 <div align="center"> <img src="pics/treiber.png"/> </div><br>
 
-
-
 **get()**
 
 最后我们来看看获取执行结果的get方法，先来看看无参的版本：
@@ -5170,7 +5172,7 @@ public V get() throws InterruptedException, ExecutionException {
 
 我们先来看看等待任务完成的`awaitDone`方法，该方法是获取任务结果最核心的方法，它完成了获取结果，挂起线程，响应中断等诸多操作：
 
-```
+```java
 private int awaitDone(boolean timed, long nanos) throws InterruptedException {
     final long deadline = timed ? System.nanoTime() + nanos : 0L;
     WaitNode q = null;
@@ -5211,7 +5213,7 @@ private int awaitDone(boolean timed, long nanos) throws InterruptedException {
 
 理清了这一点后，我们再来详细看看`awaitDone`方法。可以看出，该方法的大框架是一个自旋操作，我们一段一段来看:
 
-```
+```java
 for (;;) {
     if (Thread.interrupted()) {
         removeWaiter(q);
@@ -5225,7 +5227,7 @@ for (;;) {
 
 当检测到线程被中断后，我们调用了removeWaiter:
 
-```
+```java
 private void removeWaiter(WaitNode node) {
     if (node != null) {
         ...
@@ -5237,7 +5239,7 @@ private void removeWaiter(WaitNode node) {
 
 接着往下看：
 
-```
+```java
 for (;;) {
     /*if (Thread.interrupted()) {
         removeWaiter(q);
@@ -5274,13 +5276,13 @@ for (;;) {
 - 否则，就说明任务还没有执行，或者任务正在执行过程中，那么这时，如果q现在还为null, 说明当前线程还没有进入等待队列，于是我们新建了一个`WaitNode`, `WaitNode`的构造函数我们之前已经看过了，就是生成了一个记录了当前线程的节点；
 - 如果q不为null，说明代表当前线程的WaitNode已经被创建出来了，则接下来如果`queued=false`，表示当前线程还没有入队，所以我们执行了:
 
-```
+```java
 queued = UNSAFE.compareAndSwapObject(this, waitersOffset, q.next = waiters, q);
 ```
 
 这行代码的作用是通过CAS操作将新建的q节点添加到`waiters`链表的头节点之前，**其实就是Treiber栈的入栈操作**，写的还是很简洁的，一行代码就搞定了，如果大家还是觉得晕乎，下面是它等价的伪代码：
 
-```
+```java
 q.next = waiters; //当前节点的next指向目前的栈顶元素
 //如果栈顶节点在这个过程中没有变，即没有发生并发入栈的情况
 if(waiters的值还是上面q.next所使用的waiters值){ 
@@ -5292,8 +5294,6 @@ if(waiters的值还是上面q.next所使用的waiters值){
 
 如果以上的条件都不满足，则再接下来因为现在是不带超时机制的get，timed为false，则`else if`代码块跳过，然后来到最后一个else, 把当前线程挂起，此时线程就处于阻塞等待的状态。
 
-
-
 至此，在任务没有执行完毕的情况下，获取任务执行结果的线程就会在Treiber栈中被`LockSupport.park(this)`挂起了。
 
 那么这个挂起的线程什么时候会被唤醒呢？有两种情况：
@@ -5303,7 +5303,7 @@ if(waiters的值还是上面q.next所使用的waiters值){
 
 我们接下来就继续看看线程被唤醒后的情况，此时，线程将回到`for(;;)`循环的开头，继续下一轮循环：
 
-```
+```java
 for (;;) {
     if (Thread.interrupted()) {
         removeWaiter(q);
@@ -5338,7 +5338,7 @@ for (;;) {
 
 首先自然还是检测中断，所不同的是，此时q已经不为null了，因此在有中断发生的情况下，在抛出中断之前，多了一步removeWaiter(q)操作，该操作是将当前线程从等待的Treiber栈中移除，相比入栈操作，这个出栈操作要复杂一点，这取决于节点是否位于栈顶。下面我们来仔细分析这个出栈操作：
 
-```
+```java
 private void removeWaiter(WaitNode node) {
     if (node != null) {
         node.thread = null;
@@ -5368,7 +5368,7 @@ private void removeWaiter(WaitNode node) {
 
 我们先来看看该节点就位于栈顶的情况，这说明在该节点入栈后，并没有别的线程再入栈了。由于一开始我们就将该节点的thread属性设为了null，因此，前面的`q.thread != null` 和 `pred != null`都不满足，我们直接进入到最后一个else if 分支：
 
-```
+```java
 else if (!UNSAFE.compareAndSwapObject(this, waitersOffset, q, s))
     continue retry;
 ```
@@ -5381,7 +5381,7 @@ else if (!UNSAFE.compareAndSwapObject(this, waitersOffset, q, s))
 
 当要移除的节点不在栈顶时，我们会一直遍历整个链表，直到找到`q.thread == null`的节点，找到之后，我们将进入
 
-```
+```java
 else if (pred != null) {
     pred.next = s;
     if (pred.thread == null) // check for race
@@ -5401,7 +5401,7 @@ else if (pred != null) {
 
 我们再回到`awaitDone`方法里：
 
-```
+```java
 private int awaitDone(boolean timed, long nanos) throws InterruptedException {
     final long deadline = timed ? System.nanoTime() + nanos : 0L;
     WaitNode q = null;
@@ -5443,11 +5443,9 @@ private int awaitDone(boolean timed, long nanos) throws InterruptedException {
 
 至此我们知道，除非被中断，否则get方法会在原地自旋等待(用的是Thread.yield，对应于`s == COMPLETING`)或者直接挂起（对应任务还没有执行完的情况），直到任务执行完成。而我们前面分析run方法和cancel方法的时候知道，在run方法结束后，或者cancel方法取消完成后，都会调用`finishCompletion()`来唤醒挂起的线程，使它们得以进入下一轮循环，获取任务执行结果。
 
-
-
 最后，等awaitDone函数返回后，get方法返回了`report(s)`，以根据任务的状态，汇报执行结果:
 
-```
+```java
 @SuppressWarnings("unchecked")
 private V report(int s) throws ExecutionException {
     Object x = outcome;
@@ -5469,7 +5467,7 @@ private V report(int s) throws ExecutionException {
 
 最后我们来看看带超时版本的get方法：
 
-```
+```java
 public V get(long timeout, TimeUnit unit) throws InterruptedException, ExecutionException, TimeoutException {
     if (unit == null)
         throw new NullPointerException();
@@ -5482,7 +5480,7 @@ public V get(long timeout, TimeUnit unit) throws InterruptedException, Execution
 
 它和上面不带超时时间的get方法很类似，只是在`awaitDone`方法中多了超时检测：
 
-```
+```java
 else if (timed) {
     nanos = deadline - System.nanoTime();
     if (nanos <= 0L) {
@@ -7151,14 +7149,16 @@ void post_write_barrier(oop* field, oop new_value) {
 - -XX:+UseG1GC 使用G1 GC。
 - -XX:MaxGCPauseMillis=n 设置最大GC停顿时间，这是一个软目标，JVM会尽最大努力去达到它。
 - -XX:InitiatingHeapOccupancyPercent=n 启动并发标记循环的堆占用率的百分比，当整个堆的占用达到比例时，启动一个全局并发标记循环，0代表并发标记一直运行。默认值是45%。
+- -XX：G1NewSizePercent：初始年轻代占整个Java Heap的大小，默认值为5%；
+- -XX：G1MaxNewSizePercent：最大年轻代占整个Java Heap的大小，默认值为60%；
 - -XX:NewRatio=n 新生代和老年代大小的比例，默认是2。
 - -XX:SurvivorRatio=n eden和survivor区域空间大小的比例，默认是8。
 - -XX:MaxTenuringThreshold=n 晋升的阈值，默认是15（一个存活对象经历多少次GC周期之后晋升到老年代)。
 - -XX:ParallelGCThreads=n 设置GC并发阶段的线程数，默认值与JVM运行平台相关。
-- -XX:ConcGCThreads=n 设置并发标记的线程数，默认值与JVM运行平台相关。
+- -XX:ConcGCThreads=n 设置并发标记的线程数，与Java应用一起执行的GC线程数量。默认是Java线程的1/4。减少这个参数的数值可能会提升并行回收的效率，即提高系统内部吞吐量（系统是一个整体，CPU资源大家都需要占用），不过如果这个数值过低，也会导致并行回收机制耗时加长；
 - -XX:G1ReservePercent=n 设置保留java堆大小比例，用于防止晋升失败/Evacuation Failure,默认值是10%。
 - -XX:G1HeapRegionSize=n 设置Region的大小，默认是根据堆的大小动态决定，大小范围是[1M,32M]
--  -XX:G1ConcRefinementThreads=n:默认等于ParallelGCThreads，g1优化线程数（处理全局的DirtyCardQueueSet，也就是论文里说的全局的filled RS buffers）
+- -XX:G1ConcRefinementThreads=n:默认等于ParallelGCThreads，g1优化线程数（处理全局的DirtyCardQueueSet，也就是论文里说的全局的filled RS buffers）
 - -XX:G1RSetUpdatingPauseTimePercent=10:默认10，更新Rset占gc暂停时间（GC evacuation pause）的比例
 - –XX:G1MixedGCLiveThresholdPercent: old generation region中的存活对象的占比，只有在此参数之下，才会被选入CSet
 - –XX:G1MixedGCCountTarget: 一次global concurrent marking之后，最多执行Mixed GC的次数。与G1MixedGCLIveThresholdPercent参数合用
@@ -7231,6 +7231,10 @@ void post_write_barrier(oop* field, oop new_value) {
 >313:(O)[0x000000054e400000,0x000000054e800000,0x000000054e800000], size = 662K, occupied = 1214K.
 >
 >Did 2759 coarsenings.
+
+**-XX：+G1PrintRegionLivenessInfo：**这个参数需要和-XX：+UnlockDiagnosticVMOptions配合启动，这可以理解，它们本身就是属于VM的调试信息。如果开启了，VM会打印堆内存里每个Region的存活对象信息。这个信息在标记循环结束后可以打印出来；
+
+**-XX：+G1TraceConcRefinement：**这个也是一个VM的调试信息。如果启用，并行回收阶段的日志就会被详细打印出来；
 
 **2、时间打印**
 
