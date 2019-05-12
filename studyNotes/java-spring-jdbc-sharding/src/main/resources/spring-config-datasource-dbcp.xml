@@ -23,12 +23,15 @@
         <property name="dataSource" ref="routingDataSource"/>
     </bean>
 
+    <!--使用注释事务 -->
+    <tx:annotation-driven  transaction-manager="transactionManager" />
+
     <bean id="sqlSessionFactory" class="org.mybatis.spring.SqlSessionFactoryBean">
         <property name="dataSource" ref="routingDataSource"/>
        <!-- <property name="configLocation" value="classpath:/mybatis-config.xml"/>-->
     </bean>
 
-    <bean id="parentDataSource" class="org.apache.commons.dbcp.BasicDataSource">
+    <bean id="parentDataSource" class="com.alibaba.druid.pool.DruidDataSource">
         <property name="driverClassName" value="${imp.jdbc.driver}"/>
         <property name="username" value="${imp.jdbc.username}"/>
         <property name="connectionProperties" value="${dbcp.connectionProperties}"/>
@@ -39,42 +42,42 @@
         <property name="maxIdle" value="${dbcp.maxIdle}"/>
     </bean>
 
-    <bean id="dataSource0" class="org.apache.commons.dbcp.BasicDataSource" parent="parentDataSource">
+    <bean id="dataSource0" class="com.alibaba.druid.pool.DruidDataSource" parent="parentDataSource">
         <property name="url" value="${imp.jdbc.url0}"/>
         <property name="password" value="${imp.jdbc.password.new}"/>
     </bean>
 
-    <bean id="dataSource1" class="org.apache.commons.dbcp.BasicDataSource" parent="parentDataSource">
+    <bean id="dataSource1" class="com.alibaba.druid.pool.DruidDataSource" parent="parentDataSource">
         <property name="url" value="${imp.jdbc.url1}"/>
         <property name="password" value="${imp.jdbc.password.new}"/>
     </bean>
 
-    <bean id="dataSource2" class="org.apache.commons.dbcp.BasicDataSource" parent="parentDataSource">
+    <bean id="dataSource2" class="com.alibaba.druid.pool.DruidDataSource" parent="parentDataSource">
         <property name="url" value="${imp.jdbc.url2}"/>
         <property name="password" value="${imp.jdbc.password.new}"/>
     </bean>
 
-    <bean id="dataSource3" class="org.apache.commons.dbcp.BasicDataSource" parent="parentDataSource">
+    <bean id="dataSource3" class="com.alibaba.druid.pool.DruidDataSource" parent="parentDataSource">
         <property name="url" value="${imp.jdbc.url3}"/>
         <property name="password" value="${imp.jdbc.password.new}"/>
     </bean>
     
-    <bean id="dataSource4" class="org.apache.commons.dbcp.BasicDataSource" parent="parentDataSource">
+    <bean id="dataSource4" class="com.alibaba.druid.pool.DruidDataSource" parent="parentDataSource">
         <property name="url" value="${imp.jdbc.url4}"/>
         <property name="password" value="${imp.jdbc.password.new}"/>
     </bean>
     
-    <bean id="dataSource5" class="org.apache.commons.dbcp.BasicDataSource" parent="parentDataSource">
+    <bean id="dataSource5" class="com.alibaba.druid.pool.DruidDataSource" parent="parentDataSource">
         <property name="url" value="${imp.jdbc.url5}"/>
         <property name="password" value="${imp.jdbc.password.new}"/>
     </bean>
     
-    <bean id="dataSource6" class="org.apache.commons.dbcp.BasicDataSource" parent="parentDataSource">
+    <bean id="dataSource6" class="com.alibaba.druid.pool.DruidDataSource" parent="parentDataSource">
         <property name="url" value="${imp.jdbc.url6}"/>
         <property name="password" value="${imp.jdbc.password.new}"/>
     </bean>
     
-    <bean id="dataSource7" class="org.apache.commons.dbcp.BasicDataSource" parent="parentDataSource">
+    <bean id="dataSource7" class="com.alibaba.druid.pool.DruidDataSource" parent="parentDataSource">
         <property name="url" value="${imp.jdbc.url7}"/>
         <property name="password" value="${imp.jdbc.password.new}"/>
     </bean>
@@ -98,6 +101,7 @@
             </map>
         </property>
         <property name="routingStrategy" ref="pinRoutingStrategy"/>
+        <property name="defaultTargetDataSource" ref="dataSource0"/>
     </bean>
 
     <bean id="sqlSession" class="org.mybatis.spring.SqlSessionTemplate">

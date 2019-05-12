@@ -2,7 +2,7 @@ package com.study.notes.jdbc.sharding;
 
 import org.springframework.util.StringUtils;
 
-public class PinRoutingStrategy  extends RoutingStrategy {
+public class PinRoutingStrategy extends RoutingStrategy {
     private String dbName;
     private int dbNum;
 

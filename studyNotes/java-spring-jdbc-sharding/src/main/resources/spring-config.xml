@@ -11,17 +11,22 @@
 
     <import resource="spring-config-datasource-dbcp.xml"/>
 
-    <bean class="org.springframework.aop.framework.autoproxy.DefaultAdvisorAutoProxyCreator"/>
+    <!-- DefaultAdvisorAutoProxyCreator搜索容器中的 advisor,并为每个bean创建代理
+        http://www.blogjava.net/cmzy/archive/2008/08/17/222624.html
+     -->
+    <!--<bean class="org.springframework.aop.framework.autoproxy.DefaultAdvisorAutoProxyCreator"/>
 
     <bean class="org.springframework.transaction.interceptor.TransactionAttributeSourceAdvisor">
         <property name="transactionInterceptor" ref="transactionInterceptor"/>
-    </bean>
+    </bean>-->
 
-    <bean id="transactionInterceptor" class="org.springframework.transaction.interceptor.TransactionInterceptor">
+
+    <!--<bean id="transactionInterceptor" class="org.springframework.transaction.interceptor.TransactionInterceptor">
         <property name="transactionManager" ref="transactionManager"/>
         <property name="transactionAttributeSource">
+            &lt;!&ndash;  @Transactional注解的处理类 &ndash;&gt;
             <bean class="org.springframework.transaction.annotation.AnnotationTransactionAttributeSource"/>
         </property>
-    </bean>
+    </bean>-->
 
 </beans>

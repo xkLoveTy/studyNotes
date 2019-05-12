@@ -55,7 +55,7 @@ public class TestExchange {
             try {
                 System.out.printf("Consumer...");
                 buffer = exchanger.exchange(buffer);
-                System.out.println("Consumer  has received:" + buffer);
+                System.out.println("Consumer has received:" + buffer);
                 Thread.sleep(1000);
                 System.out.println("eating: " + buffer);
                 buffer.clear();

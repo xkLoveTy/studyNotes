@@ -74,7 +74,7 @@ public class CompLeteServiceTest {
             int totalSleepTime = 0;
             for (int i = 1; i <= loopCounter; i++) {
                 try {
-                    Thread.sleep(1000);
+                    Thread.sleep(1500);
                     totalSleepTime += 100;
                 } catch (Exception e) {
                     System.out.println("Task #" + this.taskId

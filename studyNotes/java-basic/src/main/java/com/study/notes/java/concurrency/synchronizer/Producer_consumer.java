@@ -27,7 +27,6 @@ public class Producer_consumer {
 
 
 
-
         p1.setNum(10);
         p2.setNum(20);
         p3.setNum(30);
