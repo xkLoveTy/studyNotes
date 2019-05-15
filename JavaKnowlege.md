@@ -2358,7 +2358,10 @@ Java 8 新增加了两个注解的程序元素类型**ElementType.TYPE_USE** 和
 让我们看看两个**Optional** 用法的小例子：一个是允许为空的值，另外一个是不允许为空的值。
 
 ```java
-`Optional< String > fullName = Optional.ofNullable( ``null` `);``System.out.println( ``"Full Name is set? "` `+ fullName.isPresent() );        ``System.out.println( ``"Full Name: "` `+ fullName.orElseGet( () -> ``"[none]"` `) ); ``System.out.println( fullName.map( s -> ``"Hey "` `+ s + ``"!"` `).orElse( ``"Hey Stranger!"`
+Optional< String > fullName = Optional.ofNullable( null );
+System.out.println( "Full Name is set? " + fullName.isPresent() );        
+System.out.println( "Full Name: " + fullName.orElseGet( () -> "[none]" ) ); 
+System.out.println( fullName.map( s -> "Hey " + s + "!" ).orElse( "Hey Stranger!" ) );
 ```
 
 如果Optional实例有非空的值，方法 isPresent() 返回true否则返回false。方法orElseGet提供了回退机制，当Optional的值为空时接受一个方法返回默认值。map()方法转化Optional当前的值并且返回一个新的Optional实例。orElse方法和orElseGet类似，但是它不接受一个方法，而是接受一个默认值。上面代码运行结果如下：
@@ -2372,7 +2375,11 @@ Hey Stranger!
 让我们大概看看另外一个例子。
 
 ```java
-`Optional< String > firstName = Optional.of( ``"Tom"` `);``System.out.println( ``"First Name is set? "` `+ firstName.isPresent() );        ``System.out.println( ``"First Name: "` `+ firstName.orElseGet( () -> ``"[none]"` `) ); ``System.out.println( firstName.map( s -> ``"Hey "` `+ s + ``"!"` `).orElse( ``"Hey Stranger!"` `) );``System.out.println();`
+Optional< String > firstName = Optional.of( "Tom" );
+System.out.println( "First Name is set? " + firstName.isPresent() );        
+System.out.println( "First Name: " + firstName.orElseGet( () -> "[none]" ) ); 
+System.out.println( firstName.map( s -> "Hey " + s + "!" ).orElse( "Hey Stranger!" ) );
+System.out.println();
 ```
 
 输出如下：
@@ -2390,19 +2397,57 @@ Hey Tom!
 Stream API让集合处理简化了很多（我们后面会看到不仅限于Java集合类）。让我们从一个简单的类Task开始来看看Stream的用法。
 
 ```java
-`public` `class` `Streams {``private` `enum` `Status {``OPEN, CLOSED``};` `private` `static` `final` `class` `Task {``private` `final` `Status status;``private` `final` `Integer points;` `Task( ``final` `Status status, ``final` `Integer points ) {``this``.status = status;``this``.points = points;``}` `public` `Integer getPoints() {``return` `points;``}` `public` `Status getStatus() {``return` `status;``}` `@Override``public` `String toString() {``return` `String.format( ``"[%s, %d]"``, status, points );``}``}``}`
+public class Streams {
+  private enum Status {
+  OPEN, CLOSED
+  };
+ 
+  private static final class Task {
+    private final Status status;
+    private final Integer points;
+
+    Task( final Status status, final Integer points ) {
+      this.status = status;
+      this.points = points;
+    }
+
+    public Integer getPoints() {
+    	return points;
+    }
+
+    public Status getStatus() {
+    	return status;
+    }
+ 
+    @Override
+    public String toString() {
+    	return String.format( "[%s, %d]", status, points );
+    }
+  }
+}
 ```
 
 Task类有一个分数的概念（或者说是伪复杂度），其次是还有一个值可以为OPEN或CLOSED的状态.让我们引入一个Task的小集合作为演示例子：
 
 ```java
-`final` `Collection< Task > tasks = Arrays.asList(``    ``new` `Task( Status.OPEN, ``5` `),``    ``new` `Task( Status.OPEN, ``13` `),``    ``new` `Task( Status.CLOSED, ``8` `) ``);`
+final Collection< Task > tasks = Arrays.asList(
+    new Task( Status.OPEN, 5 ),
+    new Task( Status.OPEN, 13 ),
+    new Task( Status.CLOSED, 8 ) 
+);
 ```
 
 第一个问题是所有的开放的Task的点数是多少？在java 8 之前，通常的做法是用foreach迭代。但是Java8里头我们会用Stream。Stream是多个元素的序列，支持串行和并行操作。
 
 ```java
-`// Calculate total points of all active tasks using sum()``final` `long` `totalPointsOfOpenTasks = tasks``    ``.stream()``    ``.filter( task -> task.getStatus() == Status.OPEN )``    ``.mapToInt( Task::getPoints )``    ``.sum();` `System.out.println( ``"Total points: "` `+ totalPointsOfOpenTasks );`
+// Calculate total points of all active tasks using sum()
+final long totalPointsOfOpenTasks = tasks
+    .stream()
+    .filter( task -> task.getStatus() == Status.OPEN )
+    .mapToInt( Task::getPoints )
+    .sum();
+ 
+System.out.println( "Total points: " + totalPointsOfOpenTasks );
 ```
 
 控制台的输出将会是：
@@ -2422,7 +2467,14 @@ Total points: 18
 Stream的另外一个价值是Stream创造性地支持并行处理。让我们看看下面这个例子，这个例子把所有task的点数加起来。
 
 ```java
-`// Calculate total points of all tasks``final` `double` `totalPoints = tasks``   ``.stream()``   ``.parallel()``   ``.map( task -> task.getPoints() ) ``// or map( Task::getPoints ) ``   ``.reduce( ``0``, Integer::sum );` `System.out.println( ``"Total points (all tasks): "` `+ totalPoints );`
+// Calculate total points of all tasks
+final double totalPoints = tasks
+   .stream()
+   .parallel()
+   .map( task -> task.getPoints() ) // or map( Task::getPoints ) 
+   .reduce( 0, Integer::sum );
+ 
+System.out.println( "Total points (all tasks): " + totalPoints );
 ```
 
 这个例子跟上面那个非常像，除了这个例子里使用了parallel()方法       并且计算最终结果的时候使用了reduce方法。
@@ -2436,7 +2488,11 @@ Total points (all tasks): 26.0
 经常会有这个一个需求：我们需要按照某种准则来对集合中的元素进行分组。Stream也可以处理这样的需求，下面是一个例子：
 
 ```java
-`// Group tasks by their status``final` `Map< Status, List< Task > > map = tasks``    ``.stream()``    ``.collect( Collectors.groupingBy( Task::getStatus ) );``System.out.println( map );`
+// Group tasks by their status
+final Map< Status, List< Task > > map = tasks
+    .stream()
+    .collect( Collectors.groupingBy( Task::getStatus ) );
+System.out.println( map );
 ```
 
 控制台的输出如下：
@@ -2448,7 +2504,18 @@ Total points (all tasks): 26.0
 让我们来计算整个集合中每个task分数（或权重）的平均值来结束task的例子。
 
 ```java
-`// Calculate the weight of each tasks (as percent of total points) ``final` `Collection< String > result = tasks``    ``.stream()                                        ``// Stream< String >``    ``.mapToInt( Task::getPoints )                     ``// IntStream``    ``.asLongStream()                                  ``// LongStream``    ``.mapToDouble( points -> points / totalPoints )   ``// DoubleStream``    ``.boxed()                                         ``// Stream< Double >``    ``.mapToLong( weigth -> ( ``long` `)( weigth * ``100` `) ) ``// LongStream``    ``.mapToObj( percentage -> percentage + ``"%"` `)      ``// Stream< String> ``    ``.collect( Collectors.toList() );                 ``// List< String > ` `System.out.println( result );`
+// Calculate the weight of each tasks (as percent of total points) 
+final Collection< String > result = tasks
+    .stream()                                        // Stream< String >
+    .mapToInt( Task::getPoints )                     // IntStream
+    .asLongStream()                                  // LongStream
+    .mapToDouble( points -> points / totalPoints )   // DoubleStream
+    .boxed()                                         // Stream< Double >
+    .mapToLong( weigth -> ( long )( weigth * 100 ) ) // LongStream
+    .mapToObj( percentage -> percentage + "%" )      // Stream< String> 
+    .collect( Collectors.toList() );                 // List< String > 
+ 
+System.out.println( result );
 ```
 
 控制台输出如下：
@@ -2460,7 +2527,10 @@ Total points (all tasks): 26.0
 最后，就像前面提到的，Stream API不仅仅处理Java集合框架。像从文本文件中逐行读取数据这样典型的I/O操作也很适合用Stream API来处理。下面用一个例子来应证这一点。
 
 ```java
-`final` `Path path = ``new` `File( filename ).toPath();``try``( Stream< String > lines = Files.lines( path, StandardCharsets.UTF_8 ) ) {``    ``lines.onClose( () -> System.out.println(``"Done!"``) ).forEach( System.out::println );``}`
+final Path path = new File( filename ).toPath();
+try( Stream< String > lines = Files.lines( path, StandardCharsets.UTF_8 ) ) {
+    lines.onClose( () -> System.out.println("Done!") ).forEach( System.out::println );
+}
 ```
 
 Stream的方法**onClose** 返回一个等价的有额外句柄的Stream，当Stream的close（）方法被调用的时候这个句柄会被执行。
@@ -2472,7 +2542,27 @@ Stream API、Lambda表达式还有接口默认方法和静态方法支持的方�
 Java 8新增加了很多方法支持并行的数组处理。最重要的大概是**parallelSort()**这个方法显著地使排序在多核计算机上速度加快。下面的小例子演示了这个新的方法（**parallelXXX**）的行为。
 
 ```java
-`</pre>``<pre ``class``=``"brush:java"``>``package` `com.javacodegeeks.java8.parallel.arrays;` `import` `java.util.Arrays;``import` `java.util.concurrent.ThreadLocalRandom;` `public` `class` `ParallelArrays {``    ``public` `static` `void` `main( String[] args ) {``        ``long``[] arrayOfLong = ``new` `long` `[ ``20000` `];        ` `        ``Arrays.parallelSetAll( arrayOfLong,``            ``index -> ThreadLocalRandom.current().nextInt( ``1000000` `) );``        ``Arrays.stream( arrayOfLong ).limit( ``10` `).forEach(``            ``i -> System.out.print( i + ``" "` `) );``        ``System.out.println();` `        ``Arrays.parallelSort( arrayOfLong );``        ``Arrays.stream( arrayOfLong ).limit( ``10` `).forEach(``            ``i -> System.out.print( i + ``" "` `) );``        ``System.out.println();``    ``}``}</pre>``<pre>`
+package com.javacodegeeks.java8.parallel.arrays;
+ 
+import java.util.Arrays;
+import java.util.concurrent.ThreadLocalRandom;
+ 
+public class ParallelArrays {
+    public static void main( String[] args ) {
+        long[] arrayOfLong = new long [ 20000 ];        
+ 
+        Arrays.parallelSetAll( arrayOfLong,
+            index -> ThreadLocalRandom.current().nextInt( 1000000 ) );
+        Arrays.stream( arrayOfLong ).limit( 10 ).forEach(
+            i -> System.out.print( i + " " ) );
+        System.out.println();
+ 
+        Arrays.parallelSort( arrayOfLong );
+        Arrays.stream( arrayOfLong ).limit( 10 ).forEach(
+            i -> System.out.print( i + " " ) );
+        System.out.println();
+    }
+}
 ```
 
 这一小段代码使用**parallelSetAll()** t方法填充这个长度是2000的数组，然后使用**parallelSort()** 排序。这个程序输出了排序前和排序后的10个数字来验证数组真的已经被排序了。示例可能的输出如下（请注意这些数字是随机产生的）
@@ -11304,7 +11394,7 @@ TCC 的全称是：Try、Confirm、Cancel。
 
 一个事务所做的修改在最终提交以前，对其它事务是不可见的。
 
-4. 持久性（Durability）
+###### 4.持久性（Durability）
 
 一旦事务提交，则其所做的修改将会永远保存到数据库中。即使系统发生崩溃，事务执行的结果也不能丢失。
 
