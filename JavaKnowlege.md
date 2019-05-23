@@ -11634,6 +11634,8 @@ SELECT ... FOR UPDATE;
 
 [MySQL 加锁处理分析原理](http://hedengcheng.com/?p=771)
 
+https://zhuanlan.zhihu.com/p/52977862
+
 多版本并发控制（Multi-Version Concurrency Control, MVCC）是 MySQL 的 InnoDB 存储引擎实现隔离级别的一种具体方式，用于实现提交读和可重复读这两种隔离级别。而未提交读隔离级别总是读取最新的数据行，无需使用 MVCC。可串行化隔离级别需要对所有读取的行都加锁，单纯使用 MVCC 无法实现。
 
 ##### 版本号
@@ -12169,7 +12171,7 @@ SELECT * FROM tag_post WHERE tag_id=1234;
 SELECT * FROM post WHERE post.id IN (123,456,567,9098,8904);
 ```
 
-#### 三、存储引擎
+#### 四、存储引擎
 
 ##### InnoDB
 
@@ -12206,7 +12208,7 @@ SELECT * FROM post WHERE post.id IN (123,456,567,9098,8904);
 - 崩溃恢复：MyISAM 崩溃后发生损坏的概率比 InnoDB 高很多，而且恢复的速度也更慢。
 - 其它特性：MyISAM 支持压缩表和空间数据索引。
 
-#### 四、数据类型
+#### 五、数据类型
 
 ##### 整型
 
@@ -12252,7 +12254,7 @@ MySQL 提供了 FROM_UNIXTIME() 函数把 UNIX 时间戳转换为日期，并提
 
 应该尽量使用 TIMESTAMP，因为它比 DATETIME 空间效率更高。
 
-#### 五、切分
+#### 六、切分
 
 ##### 水平切分
 
@@ -12292,7 +12294,7 @@ MySQL 提供了 FROM_UNIXTIME() 函数把 UNIX 时间戳转换为日期，并提
 - 为每个分片指定一个 ID 范围
 - 分布式 ID 生成器 (如 Twitter 的 Snowflake 算法)
 
-#### 六、复制
+#### 七、复制
 
 ##### 主从复制
 
