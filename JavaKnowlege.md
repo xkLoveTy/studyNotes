@@ -12056,8 +12056,6 @@ customer_id_selectivity: 0.0373
 
 - **Index key：**pubtime > 1 and puptime < 20。此条件，用于确定SQL在idx_t1_pu索引上的查询范围。
 
-  
-
 - **Index Filter：**userid = ‘hdc’ 。此条件，可以在idx_t1_pu索引上进行过滤，但不属于Index Key。
 
 - **Table Filter：**comment is not NULL。此条件，在idx_t1_pu索引上无法过滤，只能在聚簇索引上过滤。
@@ -12343,8 +12341,6 @@ MySQL 提供了 FROM_UNIXTIME() 函数把 UNIX 时间戳转换为日期，并提
 这就是缓存雪崩。
 
 [![redis-caching-avalanche](https://github.com/Fi-Null/advanced-java/raw/master/images/redis-caching-avalanche.png)](https://github.com/Fi-Null/advanced-java/blob/master/images/redis-caching-avalanche.png)
-
-大约在 3 年前，国内比较知名的一个互联网公司，曾因为缓存事故，导致雪崩，后台系统全部崩溃，事故从当天下午持续到晚上凌晨 3~4 点，公司损失了几千万。
 
 缓存雪崩的事前事中事后的解决方案如下。
 
