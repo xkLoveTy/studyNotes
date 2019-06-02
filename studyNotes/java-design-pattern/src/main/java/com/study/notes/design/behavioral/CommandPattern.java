@@ -1,4 +1,4 @@
-package com.study.notes.behavioral;
+package com.study.notes.design.behavioral;
 
 import java.util.ArrayList;
 import java.util.List;

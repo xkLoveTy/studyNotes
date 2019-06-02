@@ -22,6 +22,9 @@
         <cglib.version>2.2.2</cglib.version>
         <netty.version>4.1.24.Final</netty.version>
         <jackson.version>2.6.0</jackson.version>
+        <junit.verison>4.8.2</junit.verison>
+        <log4j.version>1.2.17</log4j.version>
+        <slfj.verison>1.8.0-beta2</slfj.verison>
     </properties>
 
 
@@ -46,6 +49,27 @@
                 <groupId>com.fasterxml.jackson.core</groupId>
                 <artifactId>jackson-databind</artifactId>
                 <version>${jackson.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>junit</groupId>
+                <artifactId>junit</artifactId>
+                <version>${junit.verison}</version>
+            </dependency>
+
+            <dependency>
+                <groupId>org.slf4j</groupId>
+                <artifactId>slf4j-api</artifactId>
+                <version>${slfj.verison}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.slf4j</groupId>
+                <artifactId>slf4j-log4j12</artifactId>
+                <version>${slfj.verison}</version>
+            </dependency>
+            <dependency>
+                <groupId>log4j</groupId>
+                <artifactId>log4j</artifactId>
+                <version>${log4j.version}</version>
             </dependency>
         </dependencies>
     </dependencyManagement>
