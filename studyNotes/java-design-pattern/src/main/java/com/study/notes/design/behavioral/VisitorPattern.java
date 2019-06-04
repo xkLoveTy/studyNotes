@@ -39,7 +39,9 @@ public class VisitorPattern {
         os.add(new Photos());
         // 创建一个访问者
         Visitor visitor = new ZhangSa();
+        Visitor visitor1 = new LiSi();
         os.action(visitor);
+        os.action(visitor1);
 
         /*
          * 优点： 1、扩展性好，可以在不修改对象结构中的元素的情况下，为对象结构中的元素添加新的功能。
