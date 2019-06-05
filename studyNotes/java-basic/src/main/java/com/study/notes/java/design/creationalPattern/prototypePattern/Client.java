@@ -12,6 +12,7 @@ public class Client {
         a.SetWorkExperience("1998-2000", "XX公司");
 
         Resume_ShallowCopy b = a.clone();
+
         b.SetWorkExperience("1998-2006", "YY企业");
 
         Resume_ShallowCopy c = a.clone();
