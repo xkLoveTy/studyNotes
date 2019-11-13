@@ -21,7 +21,7 @@
         <disruptor.version>3.4.2</disruptor.version>
         <cglib.version>2.2.2</cglib.version>
         <netty.version>4.1.24.Final</netty.version>
-        <jackson.version>2.6.0</jackson.version>
+        <jackson.version>2.9.10.1</jackson.version>
         <junit.verison>4.8.2</junit.verison>
         <log4j.version>1.2.17</log4j.version>
         <slfj.verison>1.8.0-beta2</slfj.verison>
